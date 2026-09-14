@@ -36,6 +36,10 @@ def cmd_say(args, config) -> int:
     planner = Planner(config, executor)
     print(f'{_bold("heard")}   {text}')
     turn = planner.think(text)
+    for note in turn.failovers:
+        print(f'{_bold("route")}   {note}')
+    if turn.provider:
+        print(f'{_bold("route")}   {turn.provider} · {turn.model}')
     for action in turn.actions:
         print(f'{_bold("action")}  {action}')
     if turn.error:
@@ -170,17 +174,30 @@ def cmd_doctor(args, config) -> int:
     except ValueError as exc:
         print(f"  ✗ {exc}")
 
-    print(_bold("openai"))
-    key = bool(os.environ.get(config.api_key_env))
-    print(f"  {_tick(key)} {config.api_key_env}"
-          + ("" if key else f"  (put it in {cfg.ENV_FILE})"))
-    print(f"  → planner model {config.planner_model} (`omarchy-voice say`)")
+    print(_bold("providers"))
+    from . import providers
+    for which, ladder_of in (("planner", providers.chat_ladder), ("realtime", providers.realtime_ladder)):
+        if which == "realtime" and config.engine == "live":
+            continue
+        try:
+            ladder = ladder_of(config)
+        except ValueError as exc:
+            print(f"  {_tick(False)} {which}: {exc}")
+            continue
+        print(f"  → {which} ladder: {' → '.join(p.name for p in ladder)}"
+              + (" (`omarchy-voice say`)" if which == "planner" else ""))
+        for provider in ladder:
+            has_key = provider.has_key()
+            where = "" if has_key else f"  ({provider.api_key_env} not set; put it in {cfg.ENV_FILE})"
+            print(f"  {_tick(has_key)} {provider.name}: "
+                  f"{provider.summary('chat' if which == 'planner' else 'realtime')}{where}")
     if config.engine == "live":
+        key = bool(os.environ.get(config.api_key_env))
+        print(f"  {_tick(key)} {config.api_key_env}"
+              + ("" if key else f"  (put it in {cfg.ENV_FILE})"))
         print(f"  → Live model {config.live_model}, voice {config.live_voice}")
         print(f"  → backend {config.live_backend_model}, max output {config.live_max_output_tokens}")
         print("  → Live voice: $0.05/minute plus backend usage; disconnects on mute")
-    else:
-        print(f"  → realtime model {config.realtime_model}, voice {config.realtime_voice}")
     if config.tasks_enabled:
         from .tasks import validate_config
         try:
@@ -328,11 +345,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text", nargs="+")
     p.add_argument("--no-confirm", action="store_true",
                    help="never prompt for held actions; just report them")
+    p.add_argument("--provider", metavar="NAME",
+                   help="use this provider profile only, ignoring routing.planner")
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("run", help="start the listening daemon")
     p.add_argument("--engine", choices=("realtime", "live"),
                    help="override the configured voice backend")
+    p.add_argument("--provider", metavar="NAME",
+                   help="use this provider profile only, ignoring routing.realtime")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("listen", help="control a running daemon")
@@ -374,12 +395,15 @@ def main(argv: list[str] | None = None) -> int:
     env_warnings = cfg.load_env_file()
     if args.command == "doctor":
         cfg.warn_env_permissions(env_warnings)
+    provider = getattr(args, "provider", None)
     config = cfg.load(
         args.config,
         dry_run=args.dry_run or None,
         verbose=args.verbose or None,
         planner_model=getattr(args, "model", None),
         engine=getattr(args, "engine", None),
+        routing_planner=[provider] if provider and args.command == "say" else None,
+        routing_realtime=[provider] if provider and args.command == "run" else None,
     )
     return args.func(args, config)
 

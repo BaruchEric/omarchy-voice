@@ -117,7 +117,11 @@ RETIRED_KEYS = {
 
 # Sections whose keys are namespaced rather than flattened, because the plain
 # names are already taken by another section.
-PREFIXED_SECTIONS = {"realtime", "live", "tasks", "network", "vision"}
+PREFIXED_SECTIONS = {"realtime", "live", "tasks", "network", "vision", "routing"}
+
+# `[providers.<name>]` tables are kept whole rather than flattened: each one is
+# a profile that providers.py validates as a unit.
+TABLE_SECTIONS = {"providers"}
 
 # List-valued policy keys union with the built-in lists unless the matching
 # `*_replace` flag is set. Unknown keys are kept so doctor can report typos.
@@ -140,6 +144,15 @@ class Config:
     max_turns: int = 12
     # Keep Realtime available while the Live transport is evaluated.
     engine: str = "realtime"
+
+    # --- routing -----------------------------------------------------------
+    # Which provider profiles to try, in order, for the typed planner and for
+    # the speech daemon. The first that answers is used; the rest are failover.
+    # `openai` is built in from the [openai] and [realtime] settings; other
+    # names come from `[providers.<name>]` tables (see providers.py).
+    routing_planner: list[str] = field(default_factory=lambda: ["openai"])
+    routing_realtime: list[str] = field(default_factory=lambda: ["openai"])
+    providers: dict = field(default_factory=dict)
 
     network_enabled: bool = True
     network_interval_seconds: float = 20.0
@@ -261,7 +274,9 @@ def load(path: Path | None = None, **overrides) -> Config:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
         for key, value in raw.items():
-            if isinstance(value, dict):
+            if key in TABLE_SECTIONS and isinstance(value, dict):
+                data[key] = value
+            elif isinstance(value, dict):
                 prefix = f"{key}_" if key in PREFIXED_SECTIONS else ""
                 data.update({f"{prefix}{k}": v for k, v in value.items()})
             else:

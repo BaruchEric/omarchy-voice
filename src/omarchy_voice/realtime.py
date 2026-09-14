@@ -35,7 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from . import capabilities
+from . import capabilities, providers
 from .config import Config, CONFIG_DIR, ENV_FILE, SAFETY_ID_FILE
 from .feedback import Feedback
 from .network import monitored_socket
@@ -43,7 +43,7 @@ from .persona import PERSONA
 from .session import ControlServer, _matches
 from .tools import TOOL_SCHEMAS, Executor, tools_for
 
-REALTIME_URL = "wss://api.openai.com/v1/realtime"
+REALTIME_URL = providers.OPENAI_REALTIME_URL
 
 # How long after her own audio stops before the microphone counts again.
 # Speakers and a room both lag: the tail is PipeWire's buffer plus however long
@@ -82,6 +82,11 @@ RECONNECT_MAX_DELAY = 30.0
 # not a failed reconnect and must not spend the budget above. Comfortably under
 # the server's own 60-minute session cap, and comfortably over a flap.
 RECONNECT_HEALTHY_SECONDS = 60.0
+# A provider that never gets as far as `session.created` this many times in a
+# row is not flapping, it is down or refusing us, and the next rung of
+# `routing.realtime` gets a turn. A 4xx on the handshake (bad key, unknown
+# model) hands over at once: waiting would not change the answer.
+PROVIDER_FAILOVER_AFTER = 2
 
 
 def frame_level(chunk: bytes) -> float:
@@ -452,6 +457,10 @@ class RealtimeSession:
         self._user_quit = False
         # Set when the websocket dies on us rather than being closed on purpose.
         self._dropped = False
+        # The rung of `routing.realtime` this session is talking to, and
+        # whether the current socket ever got a `session.created` back.
+        self.provider: providers.Provider | None = None
+        self._established = False
         self._exit_code = 0
 
     # -- plumbing -----------------------------------------------------------
@@ -497,22 +506,23 @@ class RealtimeSession:
 
     async def _session_update(self) -> dict:
         rate = self.config.realtime_sample_rate
+        provider = self.provider or self._ladder()[0]
         return {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "model": self.config.realtime_model,
+                "model": provider.realtime_model,
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": rate},
                         "turn_detection": self._turn_detection(),
-                        **({"transcription": {"model": self.config.realtime_transcribe_model}}
-                           if self.config.realtime_transcribe_model else {}),
+                        **({"transcription": {"model": provider.realtime_transcribe_model}}
+                           if provider.realtime_transcribe_model else {}),
                     },
                     "output": {
                         "format": {"type": "audio/pcm", "rate": rate},
-                        "voice": self.config.realtime_voice,
+                        "voice": provider.realtime_voice,
                     },
                 },
                 "instructions": await self._instructions(),
@@ -861,6 +871,7 @@ class RealtimeSession:
         kind = event.get("type", "")
 
         if kind == "session.created":
+            self._established = True
             self.feedback.log(f"start   realtime session {event.get('session', {}).get('id', '?')}")
         elif kind == "input_audio_buffer.speech_started":
             self.feedback.state("listening")
@@ -1125,31 +1136,43 @@ class RealtimeSession:
         return f"Cancelled: {held}. It was not run."
 
     # -- main loop ----------------------------------------------------------
+    def _ladder(self) -> list[providers.Provider]:
+        try:
+            return providers.realtime_ladder(self.config, openai_realtime_url=REALTIME_URL)
+        except ValueError as exc:
+            raise RealtimeUnavailable(f"provider config: {exc}") from exc
+
     async def run(self) -> int:
         self.loop = asyncio.get_running_loop()
-        key = os.environ.get(self.config.api_key_env, "")
-        if not key:
+        configured = self._ladder()
+        ladder = [p for p in configured if p.has_key()]
+        if not ladder:
+            names = ", ".join(p.api_key_env for p in configured)
             raise RealtimeUnavailable(
-                f"{self.config.api_key_env} is not set — "
-                "the realtime engine needs an OpenAI API key")
-
-        url = f"{REALTIME_URL}?model={self.config.realtime_model}"
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "OpenAI-Safety-Identifier": _safety_identifier(),
-        }
+                f"no realtime provider has a key — put one of {names} in {ENV_FILE}")
 
         control = ControlServer(self._control)
         control.start()
         self._watch_task = asyncio.create_task(self._watch_loop())
         self.feedback.state("listening" if self.active else "idle")
-        self.feedback.log(f"start   engine=realtime model={self.config.realtime_model} "
-                          f"voice={self.config.realtime_voice} "
-                          f"dry_run={self.config.dry_run}")
         self.feedback.log("gate    muted — press SUPER + SHIFT + V to start listening")
 
         try:
-            await self._serve(url, headers)
+            for index, provider in enumerate(ladder):
+                self.provider = provider
+                url = f"{provider.realtime_url}?model={provider.realtime_model}"
+                headers = provider.realtime_headers(_safety_identifier())
+                self.feedback.log(f"start   engine=realtime provider={provider.name} "
+                                  f"model={provider.realtime_model} "
+                                  f"voice={provider.realtime_voice} "
+                                  f"dry_run={self.config.dry_run}")
+                following = ladder[index + 1] if index + 1 < len(ladder) else None
+                outcome = await self._serve(url, headers, last=following is None)
+                if outcome != "failover" or following is None:
+                    break
+                self.feedback.log(f"retry   {provider.name} never answered — "
+                                  f"failing over to {following.name}")
+                self.feedback.state("error", f"failing over to {following.name}")
         except RealtimeUnavailable:
             raise
         except asyncio.CancelledError:
@@ -1171,7 +1194,7 @@ class RealtimeSession:
             self.ws = None
         return 0 if self._user_quit else self._exit_code
 
-    async def _serve(self, url: str, headers: dict) -> None:
+    async def _serve(self, url: str, headers: dict, last: bool = True) -> str | None:
         """Hold a session open, and rebuild it when the socket dies.
 
         A websocket to OpenAI does not survive a laptop sleeping, a wifi hiccup,
@@ -1184,20 +1207,36 @@ class RealtimeSession:
         So a drop is not the end of the run. Reconnect, with backoff, and only
         give up after RECONNECT_ATTEMPTS in a row — at which point exiting
         non-zero is right and systemd should have a turn.
+
+        A provider that never answers at all is a different case from one that
+        drops. Unless this is the last rung of the ladder, PROVIDER_FAILOVER_AFTER
+        dead starts in a row (or one rejected handshake) return "failover" so
+        the caller can move on instead of burning the reconnect budget here.
         """
         delay = RECONNECT_BASE_DELAY
         attempt = 0
+        dead_starts = 0
         while not self._user_quit:
             self._dropped = False
+            self._established = False
             self._stop.clear()
             connected_at = time.monotonic()
+            rejected = False
             try:
                 await self._open_one(url, headers)
             except (RealtimeUnavailable, asyncio.CancelledError):
                 raise
             except Exception as exc:
                 self._dropped = True
+                rejected = _handshake_rejected(exc)
                 self.feedback.log(f"error   {type(exc).__name__}: {exc}")
+
+            if self._established:
+                dead_starts = 0
+            else:
+                dead_starts += 1
+                if not last and (rejected or dead_starts >= PROVIDER_FAILOVER_AFTER):
+                    return "failover"
 
             # The budget is meant to be consecutive failures, and it was
             # counting the daemon's whole life. The counter only reset when a
@@ -1311,6 +1350,17 @@ class RealtimeSession:
 
 
 # --- helpers ----------------------------------------------------------------
+
+def _handshake_rejected(exc: BaseException) -> bool:
+    """A 4xx on the websocket handshake: wrong key, unknown model, no such route.
+
+    websockets raises InvalidStatus with the HTTP response attached. Anything
+    else (refused, reset, timed out) is a transport problem and gets a retry.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
+
 
 def _retry_after(message: str) -> float:
     """Seconds to wait, read out of the server's own "try again in ..." text.
@@ -1453,8 +1503,12 @@ def check_ready(config: Config) -> list[str]:
         import websockets  # noqa: F401
     except ImportError:
         problems.append("python-websockets is not installed (sudo pacman -S python-websockets)")
-    if not os.environ.get(config.api_key_env):
-        problems.append(f"{config.api_key_env} is not set")
+    try:
+        ladder = providers.realtime_ladder(config, openai_realtime_url=REALTIME_URL)
+    except ValueError as exc:
+        problems.append(f"provider config: {exc}")
+    else:
+        problems.extend(providers.missing_keys(ladder))
     for tool, package in (("pw-record", "pipewire-audio"), ("pw-cat", "pipewire-audio")):
         if not shutil.which(tool):
             problems.append(f"{tool} is missing (install {package})")
@@ -1483,9 +1537,9 @@ def run(config: Config) -> int:
     # still type at it with `listen say`.
     soft = ("audio input", "loopback")
     hard = [p for p in problems if not any(s in p for s in soft)]
-    unconfigured = [p for p in hard if config.api_key_env in p]
+    unconfigured = [p for p in hard if " is not set" in p]
     if unconfigured:
-        note = f"{config.api_key_env} is not set — put it in {ENV_FILE}"
+        note = f"{unconfigured[0].split(' (')[0]} — put it in {ENV_FILE}"
         print(note)
         print("then: systemctl --user restart omarchy-voice")
         Feedback(config).state("unconfigured", note)

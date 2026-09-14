@@ -109,6 +109,37 @@ See [Live setup](docs/live.md) for model access, session limits, audio behavior,
 and switching engines. Shell execution is disabled by default. Confirmation
 rules reduce mistakes but do not make desktop automation a sandbox.
 
+### Providers and failover
+
+The typed planner and the Realtime daemon each try a ladder of provider
+profiles in order. The first rung that answers is used; a rung with no key,
+an unreachable host, a rejected handshake, or an error response hands the
+request to the next one. `openai` is built in from the `[openai]` and
+`[realtime]` sections. Add other endpoints under `[providers.<name>]` and list
+them under `[routing]`:
+
+```toml
+[routing]
+planner  = ["openai", "openrouter"]
+realtime = ["openai"]
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+chat_url    = "https://openrouter.ai/api/v1/chat/completions"
+chat_model  = "openai/gpt-4.1-mini"
+cost        = "per model, see openrouter.ai/models"
+```
+
+Every endpoint must speak OpenAI's wire format: Chat Completions with
+function tools for the planner, the Realtime GA protocol for the daemon.
+OpenRouter, LiteLLM, Groq and most "OpenAI-compatible" vendor routes qualify
+for the planner; for the daemon, a LiteLLM realtime passthrough does. Plain
+`ws://` and `http://` endpoints are accepted only for loopback, LAN and tailnet
+hosts. The `duplex`, `latency`, `cost` and `notes` fields are free text that
+`omarchy-voice doctor` prints next to each rung; nothing routes on them.
+`say --provider NAME` and `run --provider NAME` pin a single rung for one run.
+Keys for every rung go in `~/.config/omarchy-voice/env`.
+
 For speakers, leave `barge_in = false` under `[ears]` to reduce echo-triggered
 commands. Use headphones or configure PipeWire echo cancellation before enabling
 interruptions; an [example configuration](share/echo-cancel.conf) is included.

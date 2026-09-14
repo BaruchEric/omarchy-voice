@@ -14,6 +14,47 @@ max_turns = 12
 # Voice daemon backend. Realtime remains the default during Live evaluation.
 engine = "realtime"       # realtime | live; or `omarchy-voice run --engine live`
 
+[routing]
+# Provider profiles to try, in order. The first that answers is used and the
+# rest are failover: a rung with no key, an unreachable host, or an error
+# response hands the request to the next one. `openai` is built in from the
+# [openai] and [realtime] sections; add more under [providers.<name>] below.
+# `omarchy-voice say --provider NAME` and `run --provider NAME` pin one rung.
+planner  = ["openai"]     # Chat Completions with function tools
+realtime = ["openai"]     # Realtime websocket, OpenAI GA protocol
+
+# Each profile may carry a chat endpoint, a realtime endpoint, or both. Every
+# endpoint must speak OpenAI's wire format; proxies such as OpenRouter and
+# LiteLLM do, and so do most vendors' "OpenAI-compatible" routes. duplex,
+# latency, cost and notes are free text: nothing routes on them, `doctor`
+# prints them so the ladder can be chosen on what each rung costs.
+#
+# [providers.openrouter]
+# api_key_env = "OPENROUTER_API_KEY"
+# chat_url    = "https://openrouter.ai/api/v1/chat/completions"
+# chat_model  = "openai/gpt-4.1-mini"
+# headers     = { "HTTP-Referer" = "https://github.com/wombatoperator/omarchy-voice" }
+# latency     = "adds a hop"
+# cost        = "per model, see openrouter.ai/models"
+#
+# [providers.litellm]           # a LiteLLM proxy on the LAN or tailnet
+# api_key_env  = "LITELLM_API_KEY"   # "" if the proxy has no master key
+# chat_url     = "http://litellm.example.lan:4000/v1/chat/completions"
+# chat_model   = "chat-fast"          # a LiteLLM alias; the proxy does its own failover
+# realtime_url = "ws://litellm.example.lan:4000/v1/realtime"  # passthrough to OpenAI
+# realtime_model = "gpt-realtime-2.1"
+# notes        = "plain ws:// is only accepted for LAN, tailnet and loopback hosts"
+#
+# [providers.groq]
+# api_key_env = "GROQ_API_KEY"
+# chat_url    = "https://api.groq.com/openai/v1/chat/completions"
+# chat_model  = "openai/gpt-oss-20b"
+# latency     = "low"
+#
+# [providers.openai]            # override pieces of the built-in profile
+# realtime_model = "gpt-realtime-mini"
+# cost = "realtime audio is billed per minute in and out"
+
 [vision]
 # Camera stays OFF until requested; start shows preview, inspect sends one frame.
 enabled = true
