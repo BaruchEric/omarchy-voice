@@ -1,4 +1,4 @@
-"""General coding worker: Responses tools or an external Codex adapter.
+"""General coding worker: Responses tools, or an external Codex or Claude Code adapter.
 
 Run in its own systemd service. Model-generated programs run in a restricted
 bubblewrap filesystem; task metadata and credentials are outside that filesystem.
@@ -182,7 +182,7 @@ class Worker:
         write_text(self.workspace, path, content)
         return {"path": path, "bytes": len(content.encode()), "sha256": hashlib.sha256(content.encode()).hexdigest()}
 
-    def run_command(self, argv, timeout_seconds=None, *, external=False, stdin_path=None):
+    def run_command(self, argv, timeout_seconds=None, *, external=False, stdin_path=None, cwd=None):
         self.check()
         if not isinstance(argv, list) or not argv or len(argv) > 128 or any(
                 not isinstance(x, str) or "\0" in x or len(x) > 64000 for x in argv):
@@ -208,13 +208,14 @@ class Worker:
         try:
             command = argv if external else sandbox_command(self.workspace, argv, self.task["spec"]["network"])
             environment = ({k: v for k, v in os.environ.items() if k in {
-                "HOME", "PATH", "LANG", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "CODEX_HOME"}}
+                "HOME", "PATH", "LANG", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+                "CODEX_HOME", "CLAUDE_CONFIG_DIR"}}
                 if external else {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
             with open_file(self.workspace, job["stdout"], "xb") as out, \
                     open_file(self.workspace, job["stderr"], "xb") as err, \
                     (open(stdin_path, "rb") if stdin_path else open(os.devnull, "rb")) as stdin, \
                     selectors.DefaultSelector() as selector:
-                process = subprocess.Popen(command, cwd=self.workspace, stdin=stdin,
+                process = subprocess.Popen(command, cwd=cwd if external and cwd else self.workspace, stdin=stdin,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                                            env=environment)
                 job.update(status="running", pid=process.pid)
@@ -458,6 +459,90 @@ class Worker:
             raise ValueError("Codex returned no bounded result file")
         self.finish(**json.loads(result_path.read_text()))
 
+    def claude(self):
+        """Claude Code in print mode, the user's own login and default model.
+
+        Unlike Codex there is no filesystem sandbox of its own: acceptEdits lets
+        it read and edit files in its directory and refuses every command, and
+        bypass lets it run commands the way the user runs it themselves. The
+        acceptance checks still re-run in OMA's isolated verifier, which sees
+        only the task workspace, so Claude is told to leave its evidence there.
+        """
+        executable = self.settings.get("claude_executable")
+        if not executable or not os.access(executable, os.X_OK):
+            raise RuntimeError("Configured Claude Code executable is missing")
+        meta = self.store.root / self.task_id
+        prompt = meta / f"prompt-{self.task['attempt']}.txt"
+        directory = self.task["spec"].get("directory") or str(self.workspace)
+        prompt.write_text(
+            PROMPT.replace("cwd /workspace", "cwd " + directory) +
+            "\nYou are the external Claude Code adapter: use your native file and shell tools. "
+            f"Your working directory is {directory}. The task workspace is {self.workspace}; "
+            "write every artifact there and give artifact paths relative to it. Check argv "
+            "vectors re-run in /workspace inside OMA's isolated verifier, which sees only the "
+            "task workspace and no home directory, so each check must verify an artifact you "
+            "wrote there. Criterion indices in checks are zero-based: the first criterion is 0. "
+            "Do not call finish: answer with the required JSON result.\n" +
+            self.initial_prompt())
+        command = [executable, "-p", "--output-format", "json", "--json-schema", json.dumps(RESULT_SCHEMA),
+                   "--max-turns", str(self.settings["max_model_calls"]), "--add-dir", str(self.workspace)]
+        if self.settings.get("claude_permission_mode") == "bypass":
+            command.append("--dangerously-skip-permissions")
+        else:
+            command += ["--permission-mode", "acceptEdits"]
+        job = self.run_command(command, self.settings["timeout_seconds"], external=True,
+                               stdin_path=prompt, cwd=directory)
+        output = self.claude_result(job)
+        usage = {"provider": "claude", "session_id": output.get("session_id"),
+                 "turns": output.get("num_turns"), "cost_usd": output.get("total_cost_usd")}
+        self.store.update(self.task_id, usage=usage)
+        if output.get("terminal_reason") == "max_turns" and output.get("session_id"):
+            # It spent the whole budget working and never got to the answer.
+            # The files are there, so ask the same session for the result and
+            # nothing else, rather than throwing the work away.
+            wrap = meta / f"wrap-up-{self.task['attempt']}.txt"
+            wrap.write_text("You are out of turns. Do no more work and run no more commands. "
+                            "Answer now with the required JSON result describing what already "
+                            "exists in the task workspace. Use outcome failed or blocked if a "
+                            "criterion is unmet; never claim work you did not finish.\n")
+            job = self.run_command(command[:command.index("--max-turns")] +
+                                   ["--max-turns", "3", "--resume", output["session_id"]] +
+                                   command[command.index("--max-turns") + 2:],
+                                   self.settings["timeout_seconds"], external=True,
+                                   stdin_path=wrap, cwd=directory)
+            output = self.claude_result(job)
+            usage["turns"] = (usage["turns"] or 0) + (output.get("num_turns") or 0)
+            usage["cost_usd"] = (usage["cost_usd"] or 0) + (output.get("total_cost_usd") or 0)
+            usage["wrapped_up"] = True
+            self.store.update(self.task_id, usage=usage)
+        if output.get("is_error") or job["exit_code"] != 0 or job["status"] != "completed":
+            reason = output.get("result") or output.get("subtype") or job.get("error") or "no result"
+            raise RuntimeError("Claude Code did not complete: " + str(reason)[:600])
+        result = output.get("structured_output")
+        if not isinstance(result, dict):
+            raise ValueError("Claude Code returned no structured result")
+        self.finish(**{k: result.get(k) for k in FINISH_PROPERTIES} | {"checks": self.zero_based(result.get("checks"))})
+
+    def zero_based(self, checks):
+        """Claude counts criteria from one when it forgets the rule. A set of
+        indices that is exactly 1..N for N criteria is shifted down rather than
+        thrown away; anything else is left for finish to judge."""
+        expected = len(self.task["spec"]["criteria"])
+        if isinstance(checks, list) and checks and all(isinstance(c, dict) for c in checks):
+            indices = sorted(c.get("criterion") for c in checks)
+            if indices == list(range(1, expected + 1)):
+                return [dict(c, criterion=c["criterion"] - 1) for c in checks]
+        return checks
+
+    def claude_result(self, job):
+        with open_file(self.workspace, job["stdout"]) as stream:
+            raw = stream.read(256000)
+        try:
+            output = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError:
+            raise ValueError("Claude Code printed something other than its JSON result") from None
+        return output if isinstance(output, dict) else {}
+
     def run(self):
         if self.task["status"] not in ACTIVE:
             return
@@ -468,8 +553,11 @@ class Worker:
             probe = self.run_command(["/usr/bin/true"], 10)
             if probe["exit_code"] != 0:
                 raise RuntimeError("Task sandbox unavailable: " + probe.get("stderr_tail", ""))
-            if self.task["spec"]["provider"] == "responses":
+            provider = self.task["spec"]["provider"]
+            if provider == "responses":
                 self.responses()
+            elif provider == "claude":
+                self.claude()
             else:
                 self.codex()
         except Cancelled:

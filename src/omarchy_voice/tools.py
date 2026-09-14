@@ -1318,9 +1318,9 @@ class Executor:
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             return Result(False, str(exc))
 
-    def _tool_task_submit(self, goal, criteria, request_key, provider=None, network=False):
+    def _tool_task_submit(self, goal, criteria, request_key, provider=None, network=False, directory=None):
         return self._task_call("submit", goal=goal, criteria=criteria, request_key=request_key,
-                               provider=provider, network=network)
+                               provider=provider, network=network, directory=directory)
 
     def _tool_task_status(self, task_id):
         return self._task_call("status", task_id=task_id)

@@ -23,15 +23,21 @@ from .workspace_files import open_file
 
 TERMINAL = {"completed", "failed", "blocked", "cancelled", "interrupted"}
 ACTIVE = {"queued", "running", "validating"}
-PROVIDERS = ("responses", "codex")
+PROVIDERS = ("responses", "codex", "claude")
+CLAUDE_PERMISSION_MODES = ("acceptEdits", "bypass")
 ROUTING = """
 Long-running work and coding:
 - For experiments, coding, benchmarks, data analysis or a multi-step task that
   needs files and programs, use task_submit with the WHOLE goal and explicit
   acceptance criteria. This is a general coding worker, not a particular experiment.
-- Choose provider=responses for OMA's own coding worker or codex when the user
-  requests Codex. Other named agents are not interchangeable: task_list reports
-  supported adapters. Do not silently substitute a different named provider.
+- Choose provider=responses for OMA's own coding worker, codex when the user
+  requests Codex, or claude when the user asks for Claude, Claude Code, or
+  "my coding agent". Other named agents are not interchangeable: task_list
+  reports supported adapters. Do not silently substitute a different named provider.
+- Claude can work in one of the user's own folders: pass directory when the
+  user names a project, a folder, or wants something on this machine changed
+  (their home for desktop configuration). Without it Claude gets a fresh
+  isolated directory like the other providers.
 - Use a stable request_key for a logical task; retries use the same key. List
   tasks before resubmitting uncertain work. A genuinely new run needs a new key.
 - Submission starts durable work in a new directory. Its ID, files and process
@@ -70,6 +76,8 @@ SCHEMAS = [
            {"goal": STRING, "criteria": {"type": "array", "items": STRING},
             "request_key": {"type": "string", "description": "Stable key for this request; reuse on retries."},
             "provider": {"type": "string", "enum": list(PROVIDERS)},
+            "directory": {"type": "string", "description": "claude only: an existing folder under the "
+                          "user's home to work in, such as a project or ~ for desktop configuration."},
             "network": {"type": "boolean", "description": "Permit network for this task's programs if needed."}},
            ("goal", "criteria", "request_key")),
     schema("task_list", "List durable work and available worker providers, without starting anything.", {}),
@@ -90,7 +98,9 @@ def validate_config(config):
     if type(config.tasks_enabled) is not bool:
         raise ValueError("tasks.enabled must be boolean")
     if config.tasks_provider not in PROVIDERS:
-        raise ValueError("tasks.provider must be responses or codex")
+        raise ValueError("tasks.provider must be responses, codex or claude")
+    if config.tasks_claude_permission_mode not in CLAUDE_PERMISSION_MODES:
+        raise ValueError("tasks.claude_permission_mode must be acceptEdits or bypass")
     if not isinstance(config.tasks_model, str) or not config.tasks_model.strip():
         raise ValueError("tasks.model must be a model name")
     for name, low, high in (("max_active", 1, 8), ("timeout_seconds", 10, 86400),
@@ -240,6 +250,33 @@ class TaskStore:
             db.execute("UPDATE notices SET delivered=1 WHERE id=?", (identity,))
 
 
+def claude_executable():
+    """Claude Code is usually a wrapper in ~/.local/bin, which a systemd user
+    service does not always have on PATH."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / "claude"
+    return str(local) if os.access(local, os.X_OK) else None
+
+
+def claude_directory(value, root):
+    """An existing directory of the user's own, never the task store."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("directory must be a path")
+    target = Path(value.strip()).expanduser()
+    if not target.is_absolute():
+        raise ValueError("directory must be absolute or start with ~")
+    target = target.resolve()
+    if target.is_relative_to(Path(root).resolve()):
+        raise ValueError("directory must not be the task store")
+    if not target.is_relative_to(Path.home().resolve()):
+        raise ValueError("directory must be under the user's home")
+    if not target.is_dir():
+        raise ValueError("directory does not exist")
+    return str(target)
+
+
 class TaskManager:
     def __init__(self, config, supervisor=None):
         validate_config(config)
@@ -250,14 +287,17 @@ class TaskManager:
     def providers(self):
         return {"responses": {"available": bool(shutil.which("bwrap")), "model": self.config.tasks_model},
                 "codex": {"available": bool(shutil.which("codex") and shutil.which("bwrap")),
-                          "model": "Codex default with user config disabled"}}
+                          "model": "Codex default with user config disabled"},
+                "claude": {"available": bool(claude_executable() and shutil.which("bwrap")),
+                           "model": "Claude Code default, the user's own login; "
+                                    f"permissions {self.config.tasks_claude_permission_mode}"}}
 
     def _check_capacity(self, db):
         active = sum(json.loads(x[0])["status"] in ACTIVE for x in db.execute("SELECT data FROM tasks"))
         if active >= self.config.tasks_max_active:
             raise ValueError("Task capacity reached; inspect existing tasks before starting more work")
 
-    def submit(self, goal, criteria, request_key, provider=None, network=False):
+    def submit(self, goal, criteria, request_key, provider=None, network=False, directory=None):
         if not self.config.tasks_enabled:
             raise ValueError("Task workers are disabled")
         if not isinstance(goal, str) or not 1 <= len(goal.strip()) <= 16000:
@@ -269,8 +309,12 @@ class TaskManager:
             raise ValueError("invalid request_key or network flag")
         provider = provider or self.config.tasks_provider
         if provider not in PROVIDERS:
-            raise ValueError("Unsupported provider; choose responses or codex")
+            raise ValueError("Unsupported provider; choose responses, codex or claude")
         spec = {"goal": goal, "criteria": criteria, "provider": provider, "network": network}
+        if directory is not None:
+            if provider != "claude":
+                raise ValueError("directory is only for the claude provider")
+            spec["directory"] = claude_directory(directory, self.store.root)
         fingerprint = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         # Reconcile old units before enforcing capacity, but never launch during inspection.
         self.list()
@@ -283,7 +327,7 @@ class TaskManager:
                 return self.view(task)
             self._check_capacity(db)
             if not self.providers()[provider]["available"]:
-                raise ValueError("Provider runtime missing: install bwrap and, for Codex, its CLI")
+                raise ValueError("Provider runtime missing: install bwrap and, for Codex or Claude, its CLI")
             identity = uuid.uuid4().hex
             workspace = self.store.root / identity / "workspace"
             workspace.mkdir(parents=True, mode=0o700)
@@ -291,6 +335,7 @@ class TaskManager:
             settings["api_key_env"] = self.config.api_key_env
             # Resolve the executable while the voice daemon still has its configured PATH.
             settings["codex_executable"] = shutil.which("codex")
+            settings["claude_executable"] = claude_executable()
             task = {"id": identity, "request_key": request_key, "fingerprint": fingerprint,
                     "spec": spec, "workspace": str(workspace), "settings": settings,
                     "status": "queued", "summary": "Worker queued", "attempt": 1,

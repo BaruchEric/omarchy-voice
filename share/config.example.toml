@@ -108,8 +108,11 @@ typed_idle_seconds = 15
 [tasks]
 # General coding, analysis and experiment workers; independent of voice sessions.
 enabled = true
-provider = "responses"  # responses | codex
-model = "gpt-6-astra"   # Responses only; Codex uses its default with user config disabled
+provider = "responses"  # responses | codex | claude; OMA picks claude when asked for Claude Code
+model = "gpt-6-astra"   # Responses only; Codex and Claude use their own defaults and logins
+# Claude Code has no sandbox of its own. acceptEdits lets it read and edit files
+# in its directory and refuses every command; bypass runs commands too.
+claude_permission_mode = "acceptEdits"   # acceptEdits | bypass
 # root = "/home/you/Documents/oma-tasks"  # default: private OMA state directory / tasks
 max_active = 1         # avoid competing GPU experiments by default
 timeout_seconds = 1800

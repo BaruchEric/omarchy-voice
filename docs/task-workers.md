@@ -5,14 +5,15 @@ to durable workers. The feature has no dataset, architecture, metric or experime
 type baked in. The spoken request supplies the goal and acceptance criteria;
 the worker chooses an implementation, executes it and produces evidence.
 
-Two providers use the same task records, artifacts and completion interface:
+Three providers use the same task records, artifacts and completion interface:
 
 | Provider | Execution | Best use |
 |---|---|---|
 | `responses` (default) | A separate Responses conversation with direct file/process tools | OMA conducts the work itself, with explicit local execution receipts |
 | `codex` | Installed Codex CLI in non-interactive mode with its workspace sandbox | Reuse an existing coding agent instead of operating its terminal UI |
+| `claude` | Installed Claude Code in print mode, the user's own login | Hand work to Claude Code, optionally inside one of the user's own folders |
 
-Grok, Claude and OpenCode may be installed, but currently have no provider adapter.
+Grok and OpenCode may be installed, but currently have no provider adapter.
 OMA should say so when one is specifically requested rather than substitute a
 different agent. New adapters belong behind the same worker contract; adding an
 agent does not require a new scheduler, voice protocol or experiment framework.
@@ -24,6 +25,8 @@ Examples of requests:
 - “Run a reproducible simulation comparing these three scheduling algorithms.
   Save the code and raw measurements, verify the results, and report back.”
 - “Use Codex to build and test a small parser. Include malformed-input cases.”
+- “Ask Claude Code to make the desktop theme more vivid.” (Claude works in the
+  home folder; with `claude_permission_mode = "bypass"` it may run commands.)
 - “Train three model sizes on a suitable image dataset. Measure CPU/GPU use,
   evaluate held-out accuracy, and save all results even if the target fails.”
 - “How is the experiment going?” / “Cancel that experiment.”
@@ -131,7 +134,25 @@ worker's filesystem isolation; it is not the same privacy boundary. Provider
 authentication, available model choices and native sandbox support must work on
 the host. [Official non-interactive Codex documentation](https://learn.chatgpt.com/docs/non-interactive-mode)
 
-Both providers return the same result structure: outcome, summary, artifact paths,
+Claude Code runs with `-p`, `--output-format json` and a `--json-schema` for the
+result, `--max-turns` set from `max_model_calls`, and `--add-dir` pointing at the
+task workspace. It uses the CLI's default model and the user's existing login,
+and it has no filesystem sandbox of its own. `tasks.claude_permission_mode`
+chooses between `acceptEdits` (the default: Claude may read and edit files in
+its directory, every command is refused) and `bypass` (commands run, the way
+the user runs Claude Code themselves). A task may name a `directory` under the
+user's home for Claude to work in, such as a project or `~` for desktop
+configuration; without one it gets the fresh task workspace like the other
+providers. Acceptance checks still re-run in OMA's isolated verifier, which
+sees only the task workspace, so Claude is told to leave its evidence there.
+If Claude spends the whole turn budget working and never returns the result,
+the adapter resumes the same session once with a three-turn budget and asks
+for the JSON result only, so finished files are not thrown away; `usage`
+then shows `wrapped_up`. The task's `usage` carries Claude's session id, turn
+count and reported cost, which is the API-equivalent figure: a claude.ai login
+draws on the plan's allowance instead.
+
+All providers return the same result structure: outcome, summary, artifact paths,
 and a runnable argument vector for each zero-based acceptance criterion. The
 supervisor re-runs those checks in the direct worker's sandbox and records their
 exit status. Incomplete outcomes may supply fewer checks. `completed` requires

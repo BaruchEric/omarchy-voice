@@ -213,6 +213,9 @@ class Config:
     tasks_max_output_tokens: int = 8192
     tasks_command_timeout_seconds: int = 600
     tasks_max_log_bytes: int = 8 * 1024 * 1024
+    # acceptEdits: Claude may read and edit files but every command is refused.
+    # bypass: Claude runs commands too, the way the user runs it themselves.
+    tasks_claude_permission_mode: str = "acceptEdits"
 
     # --- ears --------------------------------------------------------------
     # There is no mode. Listening is off when the daemon starts and only the

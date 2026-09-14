@@ -82,6 +82,15 @@ RECONNECT_MAX_DELAY = 30.0
 # not a failed reconnect and must not spend the budget above. Comfortably under
 # the server's own 60-minute session cap, and comfortably over a flap.
 RECONNECT_HEALTHY_SECONDS = 60.0
+# OpenAI closes a realtime session at 60 minutes whether or not anyone spoke.
+# Holding a socket open while muted spends that hour doing nothing, and the
+# expiry then lands mid-use: on the GPD it hit 34 s after listening was
+# toggled on, and the user got a red orb, an error notification, a muted
+# gate and a two-second gap while a reconnect ran. So a socket older than
+# this is retired at the next quiet moment (muted, or between turns) and a
+# fresh one opened without going through the reconnect machinery.
+SESSION_ROTATE_SECONDS = 50 * 60
+SESSION_ROTATE_POLL_SECONDS = 1.0
 # A provider that never gets as far as `session.created` this many times in a
 # row is not flapping, it is down or refusing us, and the next rung of
 # `routing.realtime` gets a turn. A 4xx on the handshake (bad key, unknown
@@ -461,6 +470,11 @@ class RealtimeSession:
         # whether the current socket ever got a `session.created` back.
         self.provider: providers.Provider | None = None
         self._established = False
+        # Set by _rotate_when_quiet: this socket is being closed on purpose,
+        # ahead of the 60-minute cap, and the next one should open at once.
+        self._rotating = False
+        # Between speech_started and speech_stopped from the server's VAD.
+        self._user_speaking = False
         self._exit_code = 0
 
     # -- plumbing -----------------------------------------------------------
@@ -874,6 +888,7 @@ class RealtimeSession:
             self._established = True
             self.feedback.log(f"start   realtime session {event.get('session', {}).get('id', '?')}")
         elif kind == "input_audio_buffer.speech_started":
+            self._user_speaking = True
             self.feedback.state("listening")
             self._user_turn_since_hold = True
             # A new instruction earns a fresh budget of tool rounds.
@@ -882,6 +897,7 @@ class RealtimeSession:
             await self._barge_in()
             self._kick_refresh()
         elif kind == "input_audio_buffer.speech_stopped":
+            self._user_speaking = False
             self.feedback.state("thinking")
         elif kind == "response.output_audio.delta":
             await self._on_audio_delta(event)
@@ -923,6 +939,12 @@ class RealtimeSession:
             message = f'{error.get("code", "error")}: {error.get("message", "")}'
             if error.get("param"):
                 message += f' (param {error["param"]})'
+            if error.get("code") == "session_expired":
+                # The hour is up. The socket closes right after this and the
+                # serve loop opens another at once; nothing for the user to
+                # act on, so no red orb and no notification.
+                self.feedback.log(f"note    {message}")
+                return
             if error.get("code") in BENIGN_ERRORS:
                 # A race, not a fault: the response finished server-side between
                 # the barge-in decision and the cancel arriving. Logged quietly
@@ -1231,6 +1253,12 @@ class RealtimeSession:
                 rejected = _handshake_rejected(exc)
                 self.feedback.log(f"error   {type(exc).__name__}: {exc}")
 
+            if self._rotating:
+                self._rotating = False
+                minutes = (time.monotonic() - connected_at) / 60
+                self.feedback.log(f"start   new session after {minutes:.0f} min, "
+                                  "ahead of the 60-minute cap")
+                continue
             if self._established:
                 dead_starts = 0
             else:
@@ -1261,7 +1289,8 @@ class RealtimeSession:
             # a failed reconnect, however it ended. Only genuine flapping —
             # dropping again straight away, over and over — should spend the
             # budget.
-            if time.monotonic() - connected_at >= RECONNECT_HEALTHY_SECONDS:
+            healthy = time.monotonic() - connected_at >= RECONNECT_HEALTHY_SECONDS
+            if healthy:
                 attempt = 0
                 delay = RECONNECT_BASE_DELAY
 
@@ -1277,11 +1306,20 @@ class RealtimeSession:
                 return
             was_listening, self.active = self.active, False
             self._active_event.clear()
-            self.feedback.state("error", f"reconnecting ({attempt}/{RECONNECT_ATTEMPTS})")
-            self.feedback.log(f"retry   reconnecting in {delay:.0f}s "
-                              f"({attempt}/{RECONNECT_ATTEMPTS})")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+            if healthy:
+                # A session that did an hour's work and then ended (the cap,
+                # or a socket the provider closed) is not a fault. Go straight
+                # back without the backoff or the error state, so the gap is
+                # one handshake and the orb never turns red.
+                minutes = (time.monotonic() - connected_at) / 60
+                self.feedback.log(f"retry   reconnecting now, the session ended "
+                                  f"after {minutes:.0f} min")
+            else:
+                self.feedback.state("error", f"reconnecting ({attempt}/{RECONNECT_ATTEMPTS})")
+                self.feedback.log(f"retry   reconnecting in {delay:.0f}s "
+                                  f"({attempt}/{RECONNECT_ATTEMPTS})")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
             # Come back the way we left: if the mic was open, reopen it.
             #
             # The `else` is not tidiness. Without it the bar and the orb keep
@@ -1311,14 +1349,17 @@ class RealtimeSession:
                 self._state_item = None
                 self._state_refreshed = 0.0
                 self._response_running = False
+                self._user_speaking = False
                 await self._send(await self._session_update())
                 mic_task = asyncio.create_task(self._mic_loop())
+                rotator = asyncio.create_task(self._rotate_when_quiet())
                 stopper = asyncio.create_task(self._stop.wait())
                 reader = asyncio.create_task(self._read(ws))
                 done, pending = await asyncio.wait(
                     {stopper, reader}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
+                rotator.cancel()
                 if reader in done and not reader.cancelled():
                     reader.result()
                     if not self._user_quit:
@@ -1330,6 +1371,20 @@ class RealtimeSession:
             await self._kill_mic()
             self.ws = None
             await asyncio.to_thread(self.executor.vision.stop_owned)
+
+    async def _rotate_when_quiet(self) -> None:
+        """Retire this socket before OpenAI does, but only between turns.
+
+        A new socket is a new conversation, so it waits for a moment when
+        nothing is in flight: the user is not mid-sentence, no response is
+        running, and she is not still speaking. Muted counts as quiet.
+        """
+        await asyncio.sleep(SESSION_ROTATE_SECONDS)
+        while self.active and (self._user_speaking or self._response_running
+                               or self.speaker.is_playing(tail=1.0)):
+            await asyncio.sleep(SESSION_ROTATE_POLL_SECONDS)
+        self._rotating = True
+        self._stop.set()
 
     async def _read(self, ws) -> None:
         async for raw in ws:

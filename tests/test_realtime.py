@@ -638,7 +638,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gave up", log)
 
     async def test_the_backoff_resets_after_a_healthy_session(self):
-        """Otherwise a good long session is followed by a 30 s wait."""
+        """A session that did its hour is not a failed reconnect: no backoff,
+        no error state, straight back. Without this a good long session
+        was followed by a 30 s wait."""
         sessions = []
 
         async def serve_then_expire(url, headers):
@@ -650,8 +652,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             self.session._dropped = True
 
         log = await self.serve_with(serve_then_expire, attempts=6)
-        # Every retry is the first retry: none of them ever reaches (2/6).
-        self.assertIn("(1/6)", log)
+        # Every retry is immediate: the budget is never spent at all.
+        self.assertIn("reconnecting now", log)
+        self.assertNotIn("(1/6)", log)
         self.assertNotIn("(2/6)", log)
 
     async def test_a_recovered_reconnect_stops_saying_error(self):

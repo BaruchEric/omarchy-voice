@@ -41,7 +41,7 @@ class TaskTests(unittest.TestCase):
         self.supervisor = Supervisor()
         self.manager = TaskManager(self.config, self.supervisor)
         self.providers = mock.patch.object(TaskManager, "providers", return_value={
-            "responses": {"available": True}, "codex": {"available": True}})
+            "responses": {"available": True}, "codex": {"available": True}, "claude": {"available": True}})
         self.providers.start()
         self.addCleanup(self.providers.stop)
 
@@ -222,6 +222,121 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=KillMode=control-group", command)
         self.assertFalse(any("OPENAI_API_KEY=" in x for x in command))
         self.assertNotIn("--scope", command)
+
+
+class ClaudeAdapterTests(TaskTests):
+    """The Claude Code provider: a print-mode run whose JSON result becomes a finish."""
+
+    def fake_claude(self, result, resumed=None):
+        """A stand-in CLI. With `resumed`, a call carrying --resume answers with that instead."""
+        script = Path(self.temp.name) / "claude"
+        script.write_text("#!/bin/sh\n"
+                          "cat > \"$PWD/prompt-seen.txt\"\n"
+                          "printf '%s\\n' \"$@\" > \"$PWD/argv-seen.txt\"\n"
+                          "echo 'evidence' > \"$PWD/report.md\"\n"
+                          "case \" $* \" in *' --resume '*) cat <<'EOF'\n" + json.dumps(resumed or {}) + "\nEOF\n"
+                          "exit 0;; esac\n"
+                          f"cat <<'EOF'\n{json.dumps(result)}\nEOF\n")
+        script.chmod(0o700)
+        return str(script)
+
+    def claude_worker(self, result, resumed=None, **kwargs):
+        with mock.patch("omarchy_voice.tasks.claude_executable",
+                        return_value=self.fake_claude(result, resumed)):
+            return self.worker(provider="claude", **kwargs)
+
+    def test_directory_must_be_the_users_own(self):
+        home = Path.home().resolve()
+        task = self.submit(key="home", provider="claude", directory="~")
+        self.assertEqual(task["spec"]["directory"], str(home))
+        with self.assertRaisesRegex(ValueError, "under the user's home"):
+            self.submit(key="root", provider="claude", directory="/")
+        with self.assertRaisesRegex(ValueError, "task store"):
+            self.submit(key="store", provider="claude", directory=self.temp.name)
+        with self.assertRaisesRegex(ValueError, "only for the claude provider"):
+            self.submit(key="other", provider="responses", directory="~")
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.submit(key="missing", provider="claude", directory="~/no-such-folder-for-oma")
+
+    def test_structured_result_becomes_the_finish(self):
+        worker = self.claude_worker({
+            "is_error": False, "session_id": "sess_1", "total_cost_usd": 0.0123,
+            "structured_output": {"outcome": "failed", "summary": "The theme is unchanged",
+                                  "artifacts": ["report.md"], "checks": []}})
+        worker.claude()
+        task = self.manager.store.get(worker.task_id)
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["summary"], "The theme is unchanged")
+        self.assertEqual(task["usage"]["cost_usd"], 0.0123)
+        self.assertEqual(self.manager.status(task["id"])["usage"]["session_id"], "sess_1")
+        self.assertEqual(task["result"]["artifacts"][0]["path"], "report.md")
+        argv = (worker.workspace / "argv-seen.txt").read_text().split("\n")
+        self.assertIn("--permission-mode", argv)
+        self.assertIn("acceptEdits", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertIn(str(worker.workspace), argv)      # --add-dir
+        self.assertIn("Claude Code adapter", (worker.workspace / "prompt-seen.txt").read_text())
+
+    def test_bypass_mode_and_a_named_directory(self):
+        self.config.tasks_claude_permission_mode = "bypass"
+        home = str(Path.home().resolve())
+        worker = self.claude_worker({"is_error": False, "structured_output": {
+            "outcome": "blocked", "summary": "nothing to do", "artifacts": [], "checks": []}}, directory="~")
+        # The fake writes into its cwd, which is the named directory, not the workspace.
+        with mock.patch.object(worker, "finish") as finish:
+            worker.claude()
+        finish.assert_called_once()
+        argv = (Path(home) / "argv-seen.txt").read_text().split("\n")
+        for name in ("argv-seen.txt", "prompt-seen.txt", "report.md"):
+            (Path(home) / name).unlink()
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--permission-mode", argv)
+
+    def test_running_out_of_turns_asks_the_same_session_for_the_result(self):
+        worker = self.claude_worker(
+            {"is_error": True, "subtype": "error_max_turns", "terminal_reason": "max_turns",
+             "session_id": "sess_9", "num_turns": 25, "total_cost_usd": 3.0},
+            resumed={"is_error": False, "num_turns": 1, "total_cost_usd": 0.1, "structured_output": {
+                "outcome": "failed", "summary": "built but unverified", "artifacts": ["report.md"], "checks": []}})
+        worker.claude()
+        task = self.manager.store.get(worker.task_id)
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["summary"], "built but unverified")
+        self.assertEqual(task["usage"]["turns"], 26)
+        self.assertAlmostEqual(task["usage"]["cost_usd"], 3.1)
+        self.assertTrue(task["usage"]["wrapped_up"])
+        argv = (worker.workspace / "argv-seen.txt").read_text().split("\n")
+        self.assertEqual(argv[argv.index("--resume") + 1], "sess_9")
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "3")
+        self.assertIn("out of turns", (worker.workspace / "prompt-seen.txt").read_text())
+
+    def test_out_of_turns_with_no_answer_names_the_reason(self):
+        worker = self.claude_worker(
+            {"is_error": True, "subtype": "error_max_turns", "terminal_reason": "max_turns", "session_id": "s"},
+            resumed={"is_error": True, "subtype": "error_max_turns", "terminal_reason": "max_turns"})
+        with self.assertRaisesRegex(RuntimeError, "error_max_turns"):
+            worker.claude()
+
+    def test_one_based_criteria_are_shifted_not_rejected(self):
+        worker = self.claude_worker({"is_error": False, "structured_output": {
+            "outcome": "failed", "summary": "counted from one",
+            "artifacts": ["report.md"], "checks": [{"criterion": 1, "argv": ["/usr/bin/true"]}]}})
+        with mock.patch.object(worker, "finish") as finish:
+            worker.claude()
+        self.assertEqual(finish.call_args.kwargs["checks"], [{"criterion": 0, "argv": ["/usr/bin/true"]}])
+        # A genuine zero-based set is untouched, and so is a partial one.
+        self.assertEqual(worker.zero_based([{"criterion": 0, "argv": ["x"]}]), [{"criterion": 0, "argv": ["x"]}])
+        self.assertEqual(worker.zero_based([{"criterion": 2, "argv": ["x"]}]), [{"criterion": 2, "argv": ["x"]}])
+
+    def test_an_error_result_blocks_the_task(self):
+        worker = self.claude_worker({"is_error": True, "result": "Failed to refresh OAuth token"})
+        with self.assertRaisesRegex(RuntimeError, "OAuth"):
+            worker.claude()
+
+    def test_a_missing_result_is_reported(self):
+        worker = self.claude_worker({"is_error": False, "result": "I did it"})
+        with self.assertRaisesRegex(ValueError, "no structured result"):
+            worker.claude()
 
 
 @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap not installed")
