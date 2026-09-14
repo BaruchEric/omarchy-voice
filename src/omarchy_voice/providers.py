@@ -22,6 +22,11 @@ working unchanged. Every endpoint must speak the OpenAI wire format: Chat
 Completions with function tools for the planner, the Realtime GA protocol
 for the daemon. Proxies such as LiteLLM and OpenRouter qualify; a vendor with
 its own protocol does not, however good its models are.
+
+The one exception is `protocol = "elevenlabs"`: the daemon then talks the
+ElevenLabs Agents websocket instead, with the desktop tools registered on the
+agent as client tools. A built-in `elevenlabs` profile carries the defaults;
+`omarchy-voice elevenlabs sync` creates the agent. See elevenlabs.py.
 """
 
 from __future__ import annotations
@@ -41,12 +46,26 @@ USER_AGENT = f"omarchy-voice/{__version__}"
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
+ELEVENLABS_REALTIME_URL = "wss://api.elevenlabs.io/v1/convai/conversation"
+ELEVENLABS_API_URL = "https://api.elevenlabs.io"
+# The LLM ElevenLabs runs behind the agent. Same default as the typed planner.
+ELEVENLABS_LLM = "gpt-4.1"
+
+# How a realtime endpoint is spoken to. `openai` is the Realtime GA protocol;
+# `elevenlabs` is the Agents websocket, which needs an agent created first.
+PROTOCOLS = ("openai", "elevenlabs")
 
 # Everything a `[providers.<name>]` table may contain. Anything else is a typo,
 # and a typo in a provider table is worth stopping on: a misspelt `chat_url`
 # silently leaves the built-in endpoint in place and bills the wrong account.
 PROFILE_KEYS = {
     "api_key_env": str,
+    "protocol": str,
+    # ElevenLabs only: the agent to converse with, and the REST base that
+    # signs the websocket URL and hosts the agent. Empty agent_id means "the
+    # one `omarchy-voice elevenlabs sync` created", recorded in CONFIG_DIR.
+    "agent_id": str,
+    "api_url": str,
     "chat_url": str,
     "chat_model": str,
     "realtime_url": str,
@@ -72,6 +91,9 @@ PRIVATE_SUFFIXES = (".local", ".lan", ".home.arpa", ".ts.net", ".internal")
 class Provider:
     name: str
     api_key_env: str = ""
+    protocol: str = "openai"
+    agent_id: str = ""
+    api_url: str = ""
     chat_url: str = ""
     chat_model: str = ""
     realtime_url: str = ""
@@ -92,6 +114,10 @@ class Provider:
         return any(_host(url).endswith("openai.com")
                    for url in (self.chat_url, self.realtime_url) if url)
 
+    @property
+    def is_elevenlabs(self) -> bool:
+        return self.protocol == "elevenlabs"
+
     def key(self) -> str:
         return os.environ.get(self.api_key_env, "") if self.api_key_env else ""
 
@@ -107,7 +133,9 @@ class Provider:
 
     def realtime_headers(self, safety_identifier: str = "") -> dict:
         headers = {"User-Agent": USER_AGENT, **self.headers}
-        if self.api_key_env:
+        # ElevenLabs authenticates the websocket with a token inside a signed
+        # URL fetched over REST; the key itself never goes on the socket.
+        if self.api_key_env and not self.is_elevenlabs:
             headers["Authorization"] = f"Bearer {self.key()}"
         # The safety identifier is an OpenAI account feature. Sending it to a
         # third party would only tell them something about this install.
@@ -122,6 +150,8 @@ class Provider:
         else:
             model, url = self.realtime_model, self.realtime_url
         parts = [f"{model} via {_host(url)}"]
+        if which != "chat" and self.is_elevenlabs:
+            parts[0] = f"ElevenLabs agent, {model} behind it, via {_host(url)}"
         for label in ("duplex", "latency", "cost", "notes"):
             value = getattr(self, label)
             if value:
@@ -179,6 +209,18 @@ def _builtin_openai(config: Config, chat_url: str, realtime_url: str) -> dict:
     }
 
 
+def _builtin_elevenlabs() -> dict:
+    return {
+        "api_key_env": "ELEVENLABS_API_KEY",
+        "protocol": "elevenlabs",
+        "api_url": ELEVENLABS_API_URL,
+        "realtime_url": ELEVENLABS_REALTIME_URL,
+        "realtime_model": ELEVENLABS_LLM,
+        "duplex": "full, server-side turn taking",
+        "cost": "per minute plus the LLM behind the agent, see elevenlabs.io/pricing",
+    }
+
+
 def profiles(config: Config, *, openai_chat_url: str = OPENAI_CHAT_URL,
              openai_realtime_url: str = OPENAI_REALTIME_URL) -> dict[str, Provider]:
     """Every provider this config knows about, built-in openai included.
@@ -186,7 +228,10 @@ def profiles(config: Config, *, openai_chat_url: str = OPENAI_CHAT_URL,
     Raises ValueError for a malformed table. The message names the key, never
     the value, so it is safe to print.
     """
-    tables: dict[str, dict] = {"openai": _builtin_openai(config, openai_chat_url, openai_realtime_url)}
+    tables: dict[str, dict] = {
+        "openai": _builtin_openai(config, openai_chat_url, openai_realtime_url),
+        "elevenlabs": _builtin_elevenlabs(),
+    }
     for name, table in (config.providers or {}).items():
         if not isinstance(table, dict):
             raise ValueError(f"providers.{name} must be a table")
@@ -212,7 +257,26 @@ def profiles(config: Config, *, openai_chat_url: str = OPENAI_CHAT_URL,
             raise ValueError(f"providers.{name}.api_key_env must name an environment variable")
         if any(not isinstance(k, str) or not isinstance(v, str) for k, v in provider.headers.items()):
             raise ValueError(f"providers.{name}.headers must map strings to strings")
-        if provider.realtime_url and not provider.realtime_voice:
+        if provider.protocol not in PROTOCOLS:
+            raise ValueError(f"providers.{name}.protocol must be one of: {', '.join(PROTOCOLS)}")
+        if provider.agent_id and not provider.agent_id.replace("_", "").replace("-", "").isalnum():
+            raise ValueError(f"providers.{name}.agent_id does not look like an agent id")
+        if provider.api_url:
+            _check_url(name, "api_url", provider.api_url, "https", "http")
+        if provider.is_elevenlabs:
+            if not provider.api_url:
+                provider = Provider(**{**provider.__dict__, "api_url": ELEVENLABS_API_URL})
+            if not provider.realtime_url:
+                provider = Provider(**{**provider.__dict__, "realtime_url": ELEVENLABS_REALTIME_URL})
+            if not provider.realtime_model:
+                provider = Provider(**{**provider.__dict__, "realtime_model": ELEVENLABS_LLM})
+            # The voice is an ElevenLabs voice id, not an OpenAI voice name, so
+            # the [realtime] voice must not leak in; empty means the agent's own.
+            # The transcriber is ElevenLabs' too, so nothing to inherit there.
+            provider = Provider(**{**provider.__dict__, "realtime_transcribe_model": ""})
+        elif provider.agent_id or provider.api_url:
+            raise ValueError(f"providers.{name} has agent_id or api_url but protocol is not elevenlabs")
+        if provider.realtime_url and not provider.realtime_voice and not provider.is_elevenlabs:
             provider = Provider(**{**provider.__dict__, "realtime_voice": config.realtime_voice})
         if provider.realtime_url and provider.realtime_transcribe_model is None:
             inherited = config.realtime_transcribe_model if name == "openai" else ""

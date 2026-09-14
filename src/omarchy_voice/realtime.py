@@ -16,6 +16,13 @@ applies.
 While listening is active, room audio is streamed continuously to OpenAI.
 The mute gate is the lifetime of the `pw-record` process — when you toggle
 listening off, capture stops, rather than being captured and discarded.
+
+A rung of `routing.realtime` with `protocol = "elevenlabs"` swaps the wire
+for the ElevenLabs Agents websocket (see elevenlabs.py) and nothing else:
+the same microphone, speaker, executor, policy, confirmations, watches and
+control socket. Where the two protocols differ, the branch is on
+`self.provider.is_elevenlabs`; the agent path opens its socket only while
+listening, because ElevenLabs bills the open conversation by the minute.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from . import capabilities, providers
+from . import capabilities, elevenlabs, providers
 from .config import Config, CONFIG_DIR, ENV_FILE, SAFETY_ID_FILE
 from .feedback import Feedback
 from .network import monitored_socket
@@ -96,6 +103,10 @@ SESSION_ROTATE_POLL_SECONDS = 1.0
 # `routing.realtime` gets a turn. A 4xx on the handshake (bad key, unknown
 # model) hands over at once: waiting would not change the answer.
 PROVIDER_FAILOVER_AFTER = 2
+# An ElevenLabs conversation opened for a typed `listen say` while muted is
+# closed again after this much quiet, since every open minute is billed.
+AGENT_TYPED_IDLE_SECONDS = 30.0
+AGENT_IDLE_POLL_SECONDS = 1.0
 
 
 def frame_level(chunk: bytes) -> float:
@@ -476,6 +487,24 @@ class RealtimeSession:
         # Between speech_started and speech_stopped from the server's VAD.
         self._user_speaking = False
         self._exit_code = 0
+        # --- the ElevenLabs agent path ---
+        # Sample rate in use. The agent announces its own formats when the
+        # conversation opens, and the recorder and player follow it.
+        self._rate = config.realtime_sample_rate
+        # Set when the socket is being closed because listening was toggled
+        # off: not a drop, not a quit, and the next one waits to be needed.
+        self._parked = False
+        # `listen say` while muted opens a conversation without the mic.
+        self._wake = asyncio.Event()
+        self._typed: list[str] = []
+        self._last_agent_activity = 0.0
+        # Tool calls from the agent run one at a time, off the reader task, so
+        # pings keep being answered while compose_windows takes its 30 s.
+        self._tool_lock = asyncio.Lock()
+        self._tool_tasks: set[asyncio.Task] = set()
+        # Hash of the last desktop snapshot sent as a contextual update, so an
+        # unchanged desktop costs nothing. The agent cannot delete old items.
+        self._snapshot_hash = ""
 
     # -- plumbing -----------------------------------------------------------
     def _on_action(self, name: str, description: str) -> None:
@@ -545,6 +574,17 @@ class RealtimeSession:
             },
         }
 
+    async def _hello(self) -> dict:
+        """The first message on a new socket, in whichever protocol it speaks."""
+        provider = self.provider or self._ladder()[0]
+        if provider.is_elevenlabs:
+            return elevenlabs.hello(provider, await self._instructions())
+        return await self._session_update()
+
+    @property
+    def _agent(self) -> bool:
+        return bool(self.provider and self.provider.is_elevenlabs)
+
     def _kick_refresh(self) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
             return
@@ -605,6 +645,8 @@ class RealtimeSession:
         # Never cut across a reply in flight, and never pile announcements on
         # top of each other. Late is fine; talking over yourself is not.
         while self._response_running and not self._stop.is_set():
+            if self._agent and time.monotonic() - self._last_agent_activity > WATCH_MIN_GAP_SECONDS:
+                break  # the agent went quiet without saying so; do not wait forever
             await asyncio.sleep(0.5)
         gap = time.time() - self._last_interruption
         if gap < WATCH_MIN_GAP_SECONDS:
@@ -613,19 +655,25 @@ class RealtimeSession:
             return
         self._last_interruption = time.time()
         tail = (job["tail"] or "").strip()
+        text = (
+            f"# A watched command finished\n\n{headline} It ran in tmux pane "
+            f"{job['target']}.\n\nThe last of what it printed:\n\n{tail}\n\n"
+            "Tell the user now, unprompted and in one short sentence: what "
+            "finished, and whether it looks like it worked, from the output "
+            "above rather than from hope. Then ask if they want you to carry "
+            "on. They did not just speak to you — do not answer as though "
+            "they had."
+        )
+        if self._agent:
+            # The agent has no "system item, then respond"; a user message is
+            # the one thing that makes it speak, so the notice is framed as one.
+            self._response_running = True
+            await self._send(elevenlabs.user_message("[system notice, not the user speaking]\n\n" + text))
+            return
         await self._send({
             "type": "conversation.item.create",
             "item": {"type": "message", "role": "system", "content": [{
-                "type": "input_text",
-                "text": (
-                    f"# A watched command finished\n\n{headline} It ran in tmux pane "
-                    f"{job['target']}.\n\nThe last of what it printed:\n\n{tail}\n\n"
-                    "Tell the user now, unprompted and in one short sentence: what "
-                    "finished, and whether it looks like it worked, from the output "
-                    "above rather than from hope. Then ask if they want you to carry "
-                    "on. They did not just speak to you — do not answer as though "
-                    "they had."
-                )}]},
+                "type": "input_text", "text": text}]},
         })
         await self._send({"type": "response.create"})
 
@@ -663,6 +711,18 @@ class RealtimeSession:
         try:
             live = await asyncio.to_thread(capabilities.live_state)
             self._state_refreshed = time.monotonic()
+            if self._agent:
+                # A contextual update cannot be withdrawn later, so only send
+                # one when the desktop has actually changed since the last.
+                digest = hashlib.sha256(live.encode()).hexdigest()
+                if digest != self._snapshot_hash:
+                    self._snapshot_hash = digest
+                    await self._send(elevenlabs.contextual_update(
+                        "# The desktop right now (current as of this turn)\n\n" + live +
+                        "\n\nThis snapshot is fresh and replaces any earlier one. Trust it "
+                        "for workspaces, monitors and window addresses instead of "
+                        "calling hypr_query again."))
+                return
             self._state_seq += 1
             item_id = f"item_omastate{self._state_seq:016d}"
             await self._send({
@@ -704,7 +764,7 @@ class RealtimeSession:
             if self._stop.is_set():
                 return
 
-            cmd = ["pw-record", "--rate", str(self.config.realtime_sample_rate),
+            cmd = ["pw-record", "--rate", str(self._rate),
                    "--channels", "1", "--format", "s16", "--latency", "20ms"]
             if self.config.device:
                 cmd += ["--target", self.config.device]
@@ -719,7 +779,8 @@ class RealtimeSession:
                 self._exit_code = 1
                 return
 
-            await self._send({"type": "input_audio_buffer.clear"})
+            if not self._agent:
+                await self._send({"type": "input_audio_buffer.clear"})
             self.feedback.log("mic     capturing")
             stdout = self._mic.stdout
             assert stdout is not None
@@ -769,9 +830,14 @@ class RealtimeSession:
                         self._held_frames = 0
                     self._appended_audio = True
                     self.feedback.level(frame_level(chunk), self.speaker.level_now())
+                    encoded = base64.b64encode(chunk).decode()
+                    if self._agent:
+                        self._last_agent_activity = time.monotonic()
+                        await self._send(elevenlabs.audio_chunk(encoded))
+                        continue
                     await self._send({
                         "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(chunk).decode(),
+                        "audio": encoded,
                     })
             finally:
                 await self._kill_mic()
@@ -826,14 +892,23 @@ class RealtimeSession:
             await self._kill_mic()
             await self.speaker.interrupt()
             await asyncio.to_thread(self.executor.vision.stop_owned)
+            if self._agent and self.ws is not None:
+                # Every open minute is billed, so muted means hung up. The next
+                # toggle opens a fresh conversation.
+                self._park()
         self.feedback.state("listening" if active else "idle")
         self.feedback.notify("Listening" if active else "Sleeping")
         self.feedback.log(f"gate    {'listening' if active else 'muted'}")
         return "listening" if active else "idle"
 
+    def _park(self) -> None:
+        """Close the agent conversation on purpose; `_serve` will not count it."""
+        self._parked = True
+        self._stop.set()
+
     async def _commit_if_manual(self) -> None:
         """With VAD off, toggling the microphone off is the end of the turn."""
-        if self._turn_detection() is not None or not self._appended_audio:
+        if self._agent or self._turn_detection() is not None or not self._appended_audio:
             return
         self._appended_audio = False
         await self._send({"type": "input_audio_buffer.commit"})
@@ -848,6 +923,18 @@ class RealtimeSession:
         self._tool_rounds = 0
         self._rate_limit_retries = 0
         self.feedback.log(f"typed   {text!r}")
+        if self._agent:
+            if self.ws is None:
+                # Muted, so no conversation is open. Queue the text and wake
+                # `_open_one`; it is sent right after the hello.
+                self._typed.append(text)
+                self._wake.set()
+                return "sent (opening a conversation for it)"
+            await self._refresh_state(force=True)
+            self._response_running = True
+            self._last_agent_activity = time.monotonic()
+            await self._send(elevenlabs.user_message(text))
+            return "sent"
         # Awaited, not kicked off: a typed turn asks for a response immediately,
         # so a background refresh would land after the model had already decided.
         # Without this a typed turn was the only kind that arrived with no
@@ -882,6 +969,9 @@ class RealtimeSession:
 
     # -- events -------------------------------------------------------------
     async def _on_event(self, event: dict) -> None:
+        if self._agent:
+            await self._on_agent_event(event)
+            return
         kind = event.get("type", "")
 
         if kind == "session.created":
@@ -955,6 +1045,153 @@ class RealtimeSession:
             self.feedback.log(f"error   {message}")
             self.feedback.state("error", message)
             self.feedback.notify("Voice error", message, urgency="normal")
+
+    # -- the ElevenLabs agent wire ------------------------------------------
+    async def _on_agent_event(self, event: dict) -> None:
+        kind = event.get("type", "")
+        if kind == "conversation_initiation_metadata":
+            meta = event.get("conversation_initiation_metadata_event") or {}
+            self._established = True
+            self._last_agent_activity = time.monotonic()
+            self.feedback.log(f"start   agent conversation {meta.get('conversation_id', '?')}")
+            await self._adopt_formats(meta)
+            for text in self._typed:
+                self.feedback.log(f"typed   {text!r} (queued)")
+                self._response_running = True
+                await self._send(elevenlabs.user_message(text))
+            self._typed.clear()
+        elif kind == "ping":
+            ping = event.get("ping_event") or {}
+            if "event_id" in ping:
+                await self._send(elevenlabs.pong(ping["event_id"]))
+        elif kind == "audio":
+            audio = (event.get("audio_event") or {}).get("audio_base_64") or ""
+            if not audio:
+                return
+            try:
+                pcm = base64.b64decode(audio)
+            except (ValueError, TypeError) as exc:
+                self.feedback.log(f"error   bad audio chunk: {exc}")
+                return
+            self._last_agent_activity = time.monotonic()
+            await self.speaker.write(pcm)
+        elif kind == "interruption":
+            # The agent noticed the user talking over it and stopped; drop
+            # what is still queued here so the room goes quiet too.
+            self._response_running = False
+            await self.speaker.interrupt()
+        elif kind == "tentative_user_transcript":
+            if not self._user_speaking:
+                self._user_speaking = True
+                self.feedback.state("listening")
+                self._kick_refresh()
+        elif kind == "user_transcript":
+            heard = ((event.get("user_transcription_event") or {}).get("user_transcript") or "").strip()
+            self._user_speaking = False
+            self._user_turn_since_hold = True
+            self._tool_rounds = 0
+            self._response_running = True
+            self._last_agent_activity = time.monotonic()
+            self.feedback.state("thinking")
+            if heard:
+                self.feedback.log(f"heard   {heard!r}")
+        elif kind == "agent_response":
+            said = ((event.get("agent_response_event") or {}).get("agent_response") or "").strip()
+            self._response_running = False
+            self._user_speaking = False
+            self._last_agent_activity = time.monotonic()
+            if said:
+                self.feedback.log(f"reply   {said!r}")
+                self.feedback.notify(said)
+            self._settle()
+        elif kind == "agent_response_correction":
+            fixed = ((event.get("agent_response_correction_event") or {})
+                     .get("corrected_agent_response") or "").strip()
+            if fixed:
+                self.feedback.log(f"reply   (cut short) {fixed!r}")
+        elif kind == "agent_response_complete":
+            self._response_running = False
+        elif kind == "client_tool_call":
+            call = event.get("client_tool_call") or {}
+            self._response_running = True
+            self._last_agent_activity = time.monotonic()
+            task = asyncio.create_task(self._agent_tool_call(call))
+            self._tool_tasks.add(task)
+            task.add_done_callback(self._tool_tasks.discard)
+        elif kind == "client_error":
+            error = event.get("error_event") or {}
+            message = f'{error.get("error_name", "error")}: {error.get("message", "")} (code {error.get("code", "?")})'
+            self.feedback.log(f"error   {message}")
+            self.feedback.state("error", message)
+            self.feedback.notify("Voice error", message, urgency="normal")
+
+    async def _adopt_formats(self, meta: dict) -> None:
+        """Record and player follow the agent's PCM rates, whatever sync set."""
+        rate_in = elevenlabs.audio_rate(meta.get("user_input_audio_format", ""))
+        rate_out = elevenlabs.audio_rate(meta.get("agent_output_audio_format", ""))
+        if rate_in is None or rate_out is None:
+            self.feedback.log("error   the agent is not configured for raw PCM audio — "
+                              "run: omarchy-voice elevenlabs sync")
+            return
+        if rate_in != self._rate:
+            self.feedback.log(f"note    agent expects {rate_in} Hz input, recording at that rate")
+            self._rate = rate_in
+        if rate_out != self.speaker.rate:
+            await self.speaker.close()
+            self.speaker.rate = rate_out
+
+    async def _agent_tool_call(self, call: dict) -> None:
+        """Run one client tool and answer it. Serialised, off the reader."""
+        name = str(call.get("tool_name") or "")
+        call_id = str(call.get("tool_call_id") or "")
+        args = call.get("parameters")
+        if not isinstance(args, dict):
+            args = {}
+        async with self._tool_lock:
+            if self._tool_rounds >= self.config.max_turns:
+                self.feedback.log(
+                    f"guard   refused {name}: {self._tool_rounds} tool calls "
+                    f"with no new user turn (max_turns={self.config.max_turns})")
+                self.feedback.notify("OMA stopped", "Too many steps without a new instruction.")
+                output = ("ERROR: too many tool calls since the user last spoke. Stop, "
+                          "tell the user where things stand, and wait to be asked.")
+            elif name == "confirm_last" and not self._user_turn_since_hold:
+                self.feedback.log("reject  no-new-turn confirm_last")
+                output = ("ERROR: confirmation must come from a new user turn after the "
+                          "action was held. Wait for the user to answer.")
+            else:
+                self._tool_rounds += 1
+                output = await self._dispatch(name, args)
+                if self.executor.pending:
+                    self._user_turn_since_hold = False
+            self._last_agent_activity = time.monotonic()
+            if call.get("expects_response", True):
+                await self._send(elevenlabs.tool_result(call_id, output))
+
+    async def _activity_loop(self) -> None:
+        """Keep the agent from re-engaging on silence while the mic is open.
+
+        Its turn timeout fires after TURN_TIMEOUT_SECONDS without the user
+        speaking and has the agent say something unprompted. A `user_activity`
+        resets that timer without touching the conversation.
+        """
+        while not self._stop.is_set():
+            await asyncio.sleep(elevenlabs.ACTIVITY_INTERVAL_SECONDS)
+            if self.active and self.ws is not None:
+                await self._send(elevenlabs.user_activity())
+
+    async def _park_when_idle(self) -> None:
+        """Hang up a conversation that only a typed turn opened, once it is done."""
+        while not self._stop.is_set():
+            await asyncio.sleep(AGENT_IDLE_POLL_SECONDS)
+            if self.active or self.speaker.is_playing(tail=1.0):
+                continue
+            if self._tool_tasks or self.executor.pending:
+                continue
+            if time.monotonic() - self._last_agent_activity >= AGENT_TYPED_IDLE_SECONDS:
+                self.feedback.log("stop    closing the agent conversation, idle while muted")
+                self._park()
+                return
 
     async def _barge_in(self) -> None:
         await self.speaker.interrupt()
@@ -1182,14 +1419,20 @@ class RealtimeSession:
         try:
             for index, provider in enumerate(ladder):
                 self.provider = provider
-                url = f"{provider.realtime_url}?model={provider.realtime_model}"
-                headers = provider.realtime_headers(_safety_identifier())
-                self.feedback.log(f"start   engine=realtime provider={provider.name} "
-                                  f"model={provider.realtime_model} "
-                                  f"voice={provider.realtime_voice} "
-                                  f"dry_run={self.config.dry_run}")
                 following = ladder[index + 1] if index + 1 < len(ladder) else None
-                outcome = await self._serve(url, headers, last=following is None)
+                if provider.is_elevenlabs and not elevenlabs.agent_id_for(provider):
+                    note = (f"{provider.name} has no agent yet — run: "
+                            "omarchy-voice elevenlabs sync")
+                    if following is None:
+                        raise RealtimeUnavailable(note)
+                    self.feedback.log(f"retry   {note}; failing over to {following.name}")
+                    continue
+                self.feedback.log(f"start   engine=realtime provider={provider.name} "
+                                  f"protocol={provider.protocol} "
+                                  f"model={provider.realtime_model} "
+                                  f"voice={provider.realtime_voice or 'agent default'} "
+                                  f"dry_run={self.config.dry_run}")
+                outcome = await self._serve(provider, last=following is None)
                 if outcome != "failover" or following is None:
                     break
                 self.feedback.log(f"retry   {provider.name} never answered — "
@@ -1216,7 +1459,7 @@ class RealtimeSession:
             self.ws = None
         return 0 if self._user_quit else self._exit_code
 
-    async def _serve(self, url: str, headers: dict, last: bool = True) -> str | None:
+    async def _serve(self, provider: providers.Provider, last: bool = True) -> str | None:
         """Hold a session open, and rebuild it when the socket dies.
 
         A websocket to OpenAI does not survive a laptop sleeping, a wifi hiccup,
@@ -1241,11 +1484,12 @@ class RealtimeSession:
         while not self._user_quit:
             self._dropped = False
             self._established = False
+            self._parked = False
             self._stop.clear()
             connected_at = time.monotonic()
             rejected = False
             try:
-                await self._open_one(url, headers)
+                await self._open_one(provider)
             except (RealtimeUnavailable, asyncio.CancelledError):
                 raise
             except Exception as exc:
@@ -1253,6 +1497,13 @@ class RealtimeSession:
                 rejected = _handshake_rejected(exc)
                 self.feedback.log(f"error   {type(exc).__name__}: {exc}")
 
+            if self._parked:
+                # Hung up on purpose because listening was toggled off. Not a
+                # drop, not a failure; go round and wait to be needed again.
+                continue
+            if self._user_quit and not self._established:
+                # Quit while waiting to be needed: nothing to count or retry.
+                return
             if self._rotating:
                 self._rotating = False
                 minutes = (time.monotonic() - connected_at) / 60
@@ -1337,9 +1588,42 @@ class RealtimeSession:
             else:
                 self.feedback.state("idle")
 
-    async def _open_one(self, url: str, headers: dict) -> None:
+    async def _endpoint(self, provider: providers.Provider) -> tuple[str, dict]:
+        """Where this rung's socket goes, worked out fresh for every connection.
+
+        A signed ElevenLabs URL is short-lived, so it is fetched here rather
+        than once per rung. An HTTP error fetching it counts as a rejected
+        handshake for failover purposes.
+        """
+        headers = provider.realtime_headers(_safety_identifier())
+        if provider.is_elevenlabs:
+            agent_id = elevenlabs.agent_id_for(provider)
+            url = await asyncio.to_thread(elevenlabs.signed_url, provider, agent_id)
+            return url, headers
+        return f"{provider.realtime_url}?model={provider.realtime_model}", headers
+
+    async def _wait_until_needed(self) -> bool:
+        """Agent path: block until listening starts or a typed turn arrives."""
+        if self.active or self._typed:
+            return True
+        self._wake.clear()
+        self.feedback.log("wait    muted, no agent conversation open")
+        waiters = [asyncio.create_task(e.wait())
+                   for e in (self._active_event, self._wake, self._stop)]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waiters:
+                task.cancel()
+        return not self._stop.is_set()
+
+    async def _open_one(self, provider: providers.Provider) -> None:
         """One socket, held until it closes or the user stops it."""
         mic_task: asyncio.Task | None = None
+        helpers: list[asyncio.Task] = []
+        if provider.is_elevenlabs and not await self._wait_until_needed():
+            return
+        url, headers = await self._endpoint(provider)
         try:
             async with monitored_socket(_open_socket(url, headers), self.config,
                                         self.feedback, "realtime", endpoint=url) as ws:
@@ -1348,18 +1632,24 @@ class RealtimeSession:
                 # tracking lives in a session that no longer exists.
                 self._state_item = None
                 self._state_refreshed = 0.0
+                self._snapshot_hash = ""
                 self._response_running = False
                 self._user_speaking = False
-                await self._send(await self._session_update())
+                self._last_agent_activity = time.monotonic()
+                await self._send(await self._hello())
                 mic_task = asyncio.create_task(self._mic_loop())
-                rotator = asyncio.create_task(self._rotate_when_quiet())
+                helpers.append(asyncio.create_task(self._rotate_when_quiet()))
+                if provider.is_elevenlabs:
+                    helpers.append(asyncio.create_task(self._activity_loop()))
+                    helpers.append(asyncio.create_task(self._park_when_idle()))
                 stopper = asyncio.create_task(self._stop.wait())
                 reader = asyncio.create_task(self._read(ws))
                 done, pending = await asyncio.wait(
                     {stopper, reader}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
-                rotator.cancel()
+                for task in helpers:
+                    task.cancel()
                 if reader in done and not reader.cancelled():
                     reader.result()
                     if not self._user_quit:
@@ -1368,6 +1658,10 @@ class RealtimeSession:
         finally:
             if mic_task is not None:
                 mic_task.cancel()
+            for task in helpers:
+                task.cancel()
+            for task in list(self._tool_tasks):
+                task.cancel()
             await self._kill_mic()
             self.ws = None
             await asyncio.to_thread(self.executor.vision.stop_owned)
@@ -1396,7 +1690,8 @@ class RealtimeSession:
                 continue
             if self.config.verbose and event.get("type") not in (
                     "response.output_audio.delta",
-                    "response.output_audio_transcript.delta"):
+                    "response.output_audio_transcript.delta",
+                    "audio", "tentative_user_transcript", "ping"):
                 print(f"  << {event.get('type')}", flush=True)
             try:
                 await self._on_event(event)
@@ -1412,6 +1707,8 @@ def _handshake_rejected(exc: BaseException) -> bool:
     websockets raises InvalidStatus with the HTTP response attached. Anything
     else (refused, reset, timed out) is a transport problem and gets a retry.
     """
+    if isinstance(exc, elevenlabs.ApiError):
+        return 400 <= exc.status < 500
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
@@ -1564,6 +1861,9 @@ def check_ready(config: Config) -> list[str]:
         problems.append(f"provider config: {exc}")
     else:
         problems.extend(providers.missing_keys(ladder))
+        keyed = [p for p in ladder if p.has_key()]
+        if keyed and all(p.is_elevenlabs and not elevenlabs.agent_id_for(p) for p in keyed):
+            problems.append(f"{keyed[0].name} has no agent yet (run: omarchy-voice elevenlabs sync)")
     for tool, package in (("pw-record", "pipewire-audio"), ("pw-cat", "pipewire-audio")):
         if not shutil.which(tool):
             problems.append(f"{tool} is missing (install {package})")
@@ -1592,9 +1892,12 @@ def run(config: Config) -> int:
     # still type at it with `listen say`.
     soft = ("audio input", "loopback")
     hard = [p for p in problems if not any(s in p for s in soft)]
-    unconfigured = [p for p in hard if " is not set" in p]
+    unconfigured = [p for p in hard if " is not set" in p or "has no agent yet" in p]
     if unconfigured:
-        note = f"{unconfigured[0].split(' (')[0]} — put it in {ENV_FILE}"
+        if " is not set" in unconfigured[0]:
+            note = f"{unconfigured[0].split(' (')[0]} — put it in {ENV_FILE}"
+        else:
+            note = unconfigured[0].replace(" (run: ", " — run: ").rstrip(")")
         print(note)
         print("then: systemctl --user restart omarchy-voice")
         Feedback(config).state("unconfigured", note)

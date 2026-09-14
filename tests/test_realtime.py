@@ -546,7 +546,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_serve_reconnects_after_a_drop_then_stops_on_quit(self):
         attempts = []
 
-        async def fake_session(url, headers):
+        async def fake_session(provider):
             attempts.append(1)
             if len(attempts) < 3:
                 self.session._dropped = True     # socket died
@@ -555,17 +555,17 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.session, "_open_one", side_effect=fake_session), \
              mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.01), \
              mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.01):
-            await self.session._serve("wss://x", {})
+            await self.session._serve(self.session._ladder()[0])
         self.assertEqual(len(attempts), 3)
 
     async def test_serve_gives_up_and_fails_after_the_cap(self):
-        async def always_drops(url, headers):
+        async def always_drops(provider):
             self.session._dropped = True
         with mock.patch.object(self.session, "_open_one", side_effect=always_drops), \
              mock.patch.object(realtime, "RECONNECT_ATTEMPTS", 2), \
              mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.01), \
              mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.01):
-            await self.session._serve("wss://x", {})
+            await self.session._serve(self.session._ladder()[0])
         # Non-zero so Restart=on-failure gets its turn.
         self.assertEqual(self.session._exit_code, 1)
         self.assertIn("gave up", self.tmp.name and
@@ -576,7 +576,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.session._active_event.set()
         calls = []
 
-        async def drop_once(url, headers):
+        async def drop_once(provider):
             calls.append(1)
             if len(calls) == 1:
                 self.session._dropped = True
@@ -585,7 +585,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.session, "_open_one", side_effect=drop_once), \
              mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.01), \
              mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.01):
-            await self.session._serve("wss://x", {})
+            await self.session._serve(self.session._ladder()[0])
         # It went back to listening rather than coming up muted.
         self.assertTrue(self.session.active)
 
@@ -605,7 +605,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(realtime, "RECONNECT_ATTEMPTS", attempts), \
              mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.001), \
              mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.001):
-            await self.session._serve("wss://x", {})
+            await self.session._serve(self.session._ladder()[0])
         return (Path(self.tmp.name) / "session.log").read_text()
 
     async def test_session_expiry_does_not_spend_the_budget(self):
@@ -614,7 +614,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         those against the cap killed this daemon after six good hours."""
         sessions = []
 
-        async def serve_then_expire(url, headers):
+        async def serve_then_expire(provider):
             sessions.append(1)
             await asyncio.sleep(self.HEALTHY * 2)     # a full, useful session
             if len(sessions) > 8:
@@ -630,7 +630,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_genuinely_flapping_socket_still_gives_up(self):
         """The cap has to keep working, or a dead network retries forever."""
-        async def drops_at_once(url, headers):
+        async def drops_at_once(provider):
             self.session._dropped = True
 
         log = await self.serve_with(drops_at_once, attempts=3)
@@ -643,7 +643,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         was followed by a 30 s wait."""
         sessions = []
 
-        async def serve_then_expire(url, headers):
+        async def serve_then_expire(provider):
             sessions.append(1)
             await asyncio.sleep(self.HEALTHY * 2)
             if len(sessions) > 3:
@@ -664,7 +664,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         it holds an urgent-tinted overlay over a working desktop."""
         calls = []
 
-        async def drop_once(url, headers):
+        async def drop_once(provider):
             calls.append(1)
             if len(calls) == 1:
                 self.session._dropped = True
@@ -675,7 +675,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.session, "_open_one", side_effect=drop_once), \
              mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.01), \
              mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.01):
-            await self.session._serve("wss://x", {})
+            await self.session._serve(self.session._ladder()[0])
         state = json.loads((Path(self.tmp.name) / "state.json").read_text())
         self.assertEqual(state["status"], "idle")
 

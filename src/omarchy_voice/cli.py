@@ -73,6 +73,48 @@ def cmd_run(args, config) -> int:
     return realtime_mod.run(config)
 
 
+def cmd_elevenlabs(args, config) -> int:
+    """Create or refresh the ElevenLabs agent that a `protocol = "elevenlabs"` rung talks to."""
+    from . import elevenlabs, providers
+    from .tools import tools_for
+    try:
+        known = providers.profiles(config)
+    except ValueError as exc:
+        print(f"provider config: {exc}", file=sys.stderr)
+        return 1
+    candidates = [p for p in known.values() if p.is_elevenlabs]
+    if args.provider:
+        provider = known.get(args.provider)
+        if provider is None or not provider.is_elevenlabs:
+            print(f"{args.provider!r} is not an elevenlabs provider profile; "
+                  f"known: {', '.join(p.name for p in candidates)}", file=sys.stderr)
+            return 1
+    else:
+        # The first elevenlabs rung on the ladder, else the built-in profile.
+        on_ladder = [known[n] for n in config.routing_realtime
+                     if n in known and known[n].is_elevenlabs]
+        provider = (on_ladder or [known["elevenlabs"]])[0]
+    if not provider.has_key():
+        print(f"{provider.api_key_env} is not set — put it in {cfg.ENV_FILE}", file=sys.stderr)
+        return 1
+    if args.action == "status":
+        agent_id = elevenlabs.agent_id_for(provider)
+        print(f"{provider.name}: " + (f"agent {agent_id}" if agent_id else "no agent yet"))
+        return 0
+    schemas = realtime_mod.to_realtime_tools(tools_for(config))
+    print(f"syncing {len(schemas)} client tools and the agent for provider {provider.name}...")
+    try:
+        record = elevenlabs.sync(provider, rate=config.realtime_sample_rate, schemas=schemas)
+    except elevenlabs.ApiError as exc:
+        print(f"elevenlabs: {exc}", file=sys.stderr)
+        return 1
+    print(f"agent {record['agent_id']} is up to date with {len(record['tools'])} tools")
+    if provider.name not in config.routing_realtime:
+        print(f"now list it: [routing] realtime = [\"{provider.name}\", ...] "
+              "and restart the daemon")
+    return 0
+
+
 def cmd_listen(args, config) -> int:
     command = args.action
     if args.action == "say":
@@ -160,6 +202,41 @@ def cmd_map(args, config) -> int:
     return 0 if ok else 1
 
 
+def _doctor_pointer() -> None:
+    """Clicks and wheel scrolls go through ydotool; say which part is missing."""
+    if not shutil.which("ydotool"):
+        print(f"  {_tick(False)} ydotool — clicks and wheel scrolls fall back to keys;")
+        print("    run: sudo bash ~/.local/share/omarchy-voice/share/setup-click.sh")
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    socket_path = os.environ.get("YDOTOOL_SOCKET") or f"{runtime}/.ydotool_socket"
+    if os.path.exists(socket_path):
+        print(f"  {_tick(True)} ydotool, ydotoold at {socket_path}")
+    else:
+        print(f"  {_tick(False)} ydotool is installed but ydotoold is not running;")
+        print("    run: systemctl --user enable --now ydotool.service")
+    if not os.access("/dev/uinput", os.W_OK):
+        print(f"  {_tick(False)} /dev/uinput is not writable by you, so ydotoold cannot")
+        print("    inject; run share/setup-click.sh with sudo, then log out and in")
+
+
+def _doctor_agent(config, provider) -> None:
+    from . import elevenlabs
+    from .tools import tools_for
+    agent_id = elevenlabs.agent_id_for(provider)
+    if not agent_id:
+        print(f"  {_tick(False)} no agent yet — run: omarchy-voice elevenlabs sync")
+        return
+    schemas = realtime_mod.to_realtime_tools(tools_for(config))
+    current = elevenlabs.fingerprint(rate=config.realtime_sample_rate, llm=provider.realtime_model,
+                                     voice_id=provider.realtime_voice,
+                                     tools=elevenlabs.tool_configs(schemas))
+    behind = elevenlabs.stale(provider, current)
+    print(f"  {_tick(not behind)} agent {agent_id}"
+          + ("  (tools changed since the last sync — run: omarchy-voice elevenlabs sync)"
+             if behind else ""))
+
+
 def cmd_doctor(args, config) -> int:
     print(_bold(f"omarchy-voice {__version__}\n"))
 
@@ -191,6 +268,8 @@ def cmd_doctor(args, config) -> int:
             where = "" if has_key else f"  ({provider.api_key_env} not set; put it in {cfg.ENV_FILE})"
             print(f"  {_tick(has_key)} {provider.name}: "
                   f"{provider.summary('chat' if which == 'planner' else 'realtime')}{where}")
+            if which == "realtime" and provider.is_elevenlabs:
+                _doctor_agent(config, provider)
     if config.engine == "live":
         key = bool(os.environ.get(config.api_key_env))
         print(f"  {_tick(key)} {config.api_key_env}"
@@ -253,6 +332,7 @@ def cmd_doctor(args, config) -> int:
     print(_bold("\nhands"))
     for tool in ("hyprctl", "omarchy", "wtype", "notify-send", "uwsm-app"):
         print(f"  {_tick(bool(shutil.which(tool)))} {tool}")
+    _doctor_pointer()
     print(f"  shell tool: {'enabled' if config.allow_shell else 'disabled'}"
           f", {len(config.deny_patterns)} deny rules"
           f", {len(config.confirm_patterns)} confirm rules")
@@ -355,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", metavar="NAME",
                    help="use this provider profile only, ignoring routing.realtime")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("elevenlabs", help="create or refresh the ElevenLabs agent for a rung")
+    p.add_argument("action", choices=("sync", "status"))
+    p.add_argument("--provider", metavar="NAME",
+                   help="which elevenlabs profile (default: the first on routing.realtime)")
+    p.set_defaults(func=cmd_elevenlabs)
 
     p = sub.add_parser("listen", help="control a running daemon")
     p.add_argument("action", choices=list(LISTEN_ACTIONS))

@@ -306,8 +306,9 @@ NOTE_LENGTH_LIMIT = 240
 YDOTOOL_BUTTONS = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
 CLICK_UNAVAILABLE = (
     "clicking needs ydotool, which is not set up on this machine. Hyprland can "
-    "move the pointer but has no click dispatcher. Tell the user to run: "
-    "sudo pacman -S ydotool && sudo systemctl enable --now ydotoold. "
+    "move the pointer but has no click dispatcher. Tell the user to run, once: "
+    "sudo bash ~/.local/share/omarchy-voice/share/setup-click.sh "
+    "(it installs ydotool and opens /dev/uinput to them). "
     "Until then, drive the app with send_shortcut instead — most things that "
     "can be clicked can also be reached with a key."
 )

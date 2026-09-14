@@ -36,7 +36,9 @@ You need an Omarchy desktop, Python 3.11 or later, PipeWire with a working
 microphone/output device, and an OpenAI API key with access to the configured
 models. The installer can install Arch's `python-websockets` package. Individual
 tools may also need `tmux`, `wtype`, `ydotool`, `grim`, or `tesseract`; `doctor`
-reports available desktop capabilities. Camera vision also needs FFmpeg
+reports available desktop capabilities. Clicking and wheel scrolling need
+`ydotool` with `/dev/uinput` open to you, which takes root once:
+`sudo bash ~/.local/share/omarchy-voice/share/setup-click.sh`. Camera vision also needs FFmpeg
 (`ffmpeg` and `ffplay`) and a supported V4L2 camera; see [OMA Vision](docs/vision.md).
 
 ```sh
@@ -139,6 +141,37 @@ hosts. The `duplex`, `latency`, `cost` and `notes` fields are free text that
 `omarchy-voice doctor` prints next to each rung; nothing routes on them.
 `say --provider NAME` and `run --provider NAME` pin a single rung for one run.
 Keys for every rung go in `~/.config/omarchy-voice/env`.
+
+ElevenLabs is the one rung that does not speak OpenAI's protocol. A built-in
+`elevenlabs` profile talks to an [ElevenLabs Agents](https://elevenlabs.io/agents)
+conversation instead: their transcription, turn taking and voice, an LLM of
+your choice behind their prompt, and the same desktop tools running locally as
+client tools. It needs an agent on their side that carries the tool schemas,
+which one command creates and later refreshes:
+
+```sh
+echo 'ELEVENLABS_API_KEY=...' >> ~/.config/omarchy-voice/env
+omarchy-voice elevenlabs sync
+```
+
+Then list the rung, first or as failover, and restart the daemon:
+
+```toml
+[routing]
+realtime = ["elevenlabs", "openai"]
+
+[providers.elevenlabs]        # optional overrides of the built-in profile
+realtime_model = "claude-sonnet-4-5"   # the LLM behind the agent
+realtime_voice = "<voice id>"          # empty keeps the agent's own voice
+```
+
+To use an agent you built in the ElevenLabs dashboard instead, set `agent_id`
+in the profile and enable the system prompt and first message overrides in
+its Security tab; the daemon sends the persona and desktop snapshot that way.
+An open agent conversation is billed by the minute, silence included, so the
+daemon opens one when listening is toggled on and hangs up when it is toggled
+off; a typed `listen say` while muted opens one briefly. `doctor` reports the
+agent id and says when the installed tools have changed since the last sync.
 
 For speakers, leave `barge_in = false` under `[ears]` to reduce echo-triggered
 commands. Use headphones or configure PipeWire echo cancellation before enabling

@@ -21,7 +21,7 @@ engine = "realtime"       # realtime | live; or `omarchy-voice run --engine live
 # [openai] and [realtime] sections; add more under [providers.<name>] below.
 # `omarchy-voice say --provider NAME` and `run --provider NAME` pin one rung.
 planner  = ["openai"]     # Chat Completions with function tools
-realtime = ["openai"]     # Realtime websocket, OpenAI GA protocol
+realtime = ["openai"]     # Realtime websocket, OpenAI GA protocol; or "elevenlabs"
 
 # Each profile may carry a chat endpoint, a realtime endpoint, or both. Every
 # endpoint must speak OpenAI's wire format; proxies such as OpenRouter and
@@ -54,6 +54,16 @@ realtime = ["openai"]     # Realtime websocket, OpenAI GA protocol
 # [providers.openai]            # override pieces of the built-in profile
 # realtime_model = "gpt-realtime-mini"
 # cost = "realtime audio is billed per minute in and out"
+#
+# ElevenLabs Agents is the one rung with its own protocol. The built-in
+# `elevenlabs` profile (key ELEVENLABS_API_KEY) needs an agent created once
+# with `omarchy-voice elevenlabs sync`; the daemon then opens a conversation
+# while listening and hangs up when muted, since open minutes are billed.
+# [providers.elevenlabs]        # override pieces of the built-in profile
+# realtime_model = "claude-sonnet-4-5"   # the LLM behind the agent
+# realtime_voice = "cjVigY5qzO86Huf0OWal" # an ElevenLabs voice id; "" keeps the agent's
+# agent_id = ""                          # an agent you made yourself, instead of sync's
+# api_url = "https://api.eu.residency.elevenlabs.io"  # data residency, if you have it
 
 [vision]
 # Camera stays OFF until requested; start shows preview, inspect sends one frame.
