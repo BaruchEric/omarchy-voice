@@ -207,6 +207,14 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(self.socket.sent, [])
 
+    async def test_repeated_toggles_within_the_debounce_window_count_once(self):
+        self.assertEqual(await self.session._toggle(), "listening")
+        for _ in range(4):
+            self.assertEqual(await self.session._toggle(), "listening")
+        self.assertTrue(self.session.active)
+        self.session._last_toggle_at -= 1
+        self.assertEqual(await self.session._toggle(), "idle")
+
     async def test_muting_stops_capture_rather_than_ignoring_it(self):
         await self.session._set_active(True)
         self.assertTrue(self.session._active_event.is_set())

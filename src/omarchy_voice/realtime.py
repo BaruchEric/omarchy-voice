@@ -58,6 +58,10 @@ REALTIME_URL = providers.OPENAI_REALTIME_URL
 # back through the mic a moment after playback "ended" and reopens the gate on
 # her own voice.
 ECHO_TAIL_SECONDS = 0.35
+# A toggle that lands this soon after the last one is the same press: key
+# chatter, a held key, or a double tap. Honouring it would flap a paid session
+# on and off and leave the user unsure which state they ended in.
+TOGGLE_DEBOUNCE_SECONDS = 0.75
 
 # 100 ms of 24 kHz mono PCM16. Small enough that turn detection feels immediate,
 # large enough that we are not sending a websocket frame every few milliseconds.
@@ -475,6 +479,7 @@ class RealtimeSession:
         # Retries spent on rate-limited responses since the user last spoke.
         self._rate_limit_retries = 0
         self._user_quit = False
+        self._last_toggle_at = 0.0
         # Set when the websocket dies on us rather than being closed on purpose.
         self._dropped = False
         # The rung of `routing.realtime` this session is talking to, and
@@ -880,6 +885,13 @@ class RealtimeSession:
             return f"error: {type(exc).__name__}: {exc}"
 
     async def _toggle(self) -> str:
+        # Measured from the last press, accepted or not, so a burst of chatter
+        # extends the window instead of slipping a second toggle through.
+        now, previous = time.monotonic(), self._last_toggle_at
+        self._last_toggle_at = now
+        if now - previous < TOGGLE_DEBOUNCE_SECONDS:
+            self.feedback.log("gate    repeated toggle within the debounce window; ignored")
+            return "listening" if self.active else "idle"
         return await self._set_active(not self.active)
 
     async def _set_active(self, active: bool) -> str:
