@@ -1,6 +1,19 @@
-"""GPT-Live transport with Responses delegation and local desktop execution.
+"""GPT-Live transport with delegated reasoning and local desktop execution.
 
 Protocol: https://developers.openai.com/api/docs/guides/voice-websockets?api=live
+Delegation: https://developers.openai.com/api/docs/guides/live-delegation
+
+GPT-Live keeps the spoken conversation and hands reasoning to a backend. Two
+backends are supported, chosen by `live.delegation`:
+
+  responses  Live calls the configured Responses model itself and forwards
+             its lifecycle inside `response.event` envelopes. The daemon runs
+             the function calls it collects and continues the response.
+  client     Live only announces that help is wanted. The daemon builds the
+             request from its own transcript history, runs a Chat Completions
+             tool loop over the planner ladder, and appends the verified
+             result to the conversation under the delegation id.
+
 The socket reader never waits on desktop tools. A single worker serializes
 actions, journals their outcomes, and rejects work from superseded sessions.
 """
@@ -17,10 +30,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from . import browser, capabilities, config as cfg, realtime
+from . import browser, capabilities, config as cfg, planner, providers, realtime
 from .playback import LiveSpeaker
 from .config import Config
 from .feedback import Feedback
+from .providers import Provider
 from .trace import Trace
 from .network import monitored_socket
 from .security import redact_text
@@ -34,6 +48,17 @@ INPUT_GAP_SECONDS = 1.2
 STEERING_SETTLE_SECONDS = 1.2
 ROUTING_WATCHDOG_SECONDS = 6.0
 VOICE_PRICE_PER_MINUTE = 0.05  # USD, documented 2026-09-10; estimate only.
+DELEGATION_MODES = ("responses", "client")
+SERVICE_TIERS = ("auto", "default", "flex", "priority")
+# A client delegation carries no task text; the transcript does. Wait for the
+# transcript to settle before building the request, and not forever for one.
+CLIENT_SETTLE_SECONDS = 0.5
+CLIENT_TRANSCRIPT_WAIT_SECONDS = 3.0
+# Every append is limited to 500 tokens; 500 bytes stays safely under that.
+APPEND_BYTES = 500
+# A tool result that would not fit a Chat Completions request several times over.
+CLIENT_TOOL_OUTPUT_CHARS = 16000
+CLIENT_CONTEXT_BYTES = 48000
 
 VOICE_PROMPT = """You are OMA (OH-mah), the voice assistant for an Omarchy desktop.
 Keep speech concise and natural. For routine actions, wait for the result instead
@@ -132,8 +157,10 @@ Latency and task accuracy:
 
 def config_problems(config: Config) -> list[str]:
     errors = []
-    if config.live_service_tier not in ("default", "priority"):
-        errors.append("live.service_tier must be default or priority")
+    if config.live_delegation not in DELEGATION_MODES:
+        errors.append("live.delegation must be responses or client")
+    if config.live_service_tier not in SERVICE_TIERS:
+        errors.append("live.service_tier must be auto, default, flex or priority")
     if config.live_sample_rate not in (16000, 24000):
         errors.append("live.sample_rate must be 16000 or 24000 for PCM16")
     if config.live_max_output_tokens < 16:
@@ -175,6 +202,178 @@ class StartupRejected(RuntimeError):
     """A rejected configuration or inaccessible model needs a user change."""
 
 
+def to_chat_tool(tool: dict) -> dict:
+    """A Responses-format function tool -> the Chat Completions shape."""
+    return {"type": "function", "function": {
+        "name": tool["name"], "description": tool.get("description", ""),
+        "parameters": tool.get("parameters") or {"type": "object", "properties": {}}}}
+
+
+def split_append(text: str, limit: int = APPEND_BYTES) -> list[str]:
+    """Break a result into appends of at most `limit` UTF-8 bytes.
+
+    Cuts fall on a sentence end, a line break or a space when one exists in
+    the second half of the window, so the voice model paraphrases whole
+    thoughts rather than half words.
+    """
+    chunks: list[str] = []
+    rest = text.strip()
+    while rest:
+        if len(rest.encode()) <= limit:
+            chunks.append(rest)
+            break
+        window = rest.encode()[:limit].decode("utf-8", errors="ignore")
+        cut = max(window.rfind(". "), window.rfind("\n"), window.rfind(" "))
+        cut = cut + 1 if cut >= len(window) // 2 else len(window)
+        chunks.append(window[:cut].strip())
+        rest = rest[cut:].strip()
+    return chunks
+
+
+class ClientBackend:
+    """The backend behind client delegation: a Chat Completions tool loop over
+    the planner ladder, run by the daemon itself.
+
+    It accepts the same commands the daemon would otherwise send to Live's
+    Responses backend (`response.item.create`, `response.create`) and reports
+    back through the same nested lifecycle events, so the tool worker, the
+    steering rules and the budgets are shared with Responses delegation. The
+    difference is where an answer goes: text is appended to the conversation
+    as commentary carrying the client delegation id, and the voice model
+    paraphrases it.
+    """
+
+    def __init__(self, session: LiveSession, instructions: str, tools: list[dict], history: list[dict]):
+        self.session = session
+        self.messages: list[dict] = [{"role": "system", "content": instructions}]
+        self.messages += [{"role": x["role"], "content": x["text"]} for x in history]
+        self.tools = [to_chat_tool(tool) for tool in tools]
+        self.delegation = ""
+        self.rung = 0
+        self.task: asyncio.Task | None = None
+        self._serial = 0
+        self._ladder: list[Provider] | None = None
+
+    def ladder(self) -> list[Provider]:
+        if self._ladder is None:
+            self._ladder = planner.usable_ladder(self.session.config)
+        return self._ladder
+
+    def busy(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def add_item(self, item: dict) -> None:
+        kind = item.get("type")
+        if kind == "function_call_output":
+            output = str(item.get("output", ""))
+            if len(output) > CLIENT_TOOL_OUTPUT_CHARS:
+                output = output[:CLIENT_TOOL_OUTPUT_CHARS] + "\n[truncated by the application]"
+            self.messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""), "content": output})
+        elif kind == "message":
+            text = "".join(part.get("text", "") for part in item.get("content", []) if isinstance(part, dict))
+            self.messages.append({"role": item.get("role", "user"), "content": text})
+        else:
+            raise ValueError(f"the client backend cannot queue a {kind} item")
+
+    def create(self) -> None:
+        if self.busy():
+            # Every caller waits for an idle backend first; this is a guard, not a queue.
+            self.session._trace("client_backend_busy")
+            self.session._backend_requested = False
+            return
+        self.settle_calls()
+        self.trim()
+        self._serial += 1
+        response_id = f"client_{self.session._epoch}_{self._serial}"
+        self.task = asyncio.create_task(self._run(response_id, self.session._epoch))
+
+    async def close(self) -> None:
+        task, self.task = self.task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def settle_calls(self) -> None:
+        """Give every tool call an output before the next request.
+
+        Chat Completions rejects an assistant turn whose tool calls are not
+        each answered by a tool message that follows it directly. A call the
+        worker never reached (a cancelled or superseded batch) is answered
+        with an error so the backend knows it did not run.
+        """
+        last = max((i for i, m in enumerate(self.messages)
+                    if m.get("role") == "assistant" and m.get("tool_calls")), default=None)
+        if last is None:
+            return
+        end = last + 1
+        while end < len(self.messages) and self.messages[end].get("role") == "tool":
+            end += 1
+        answered = {m.get("tool_call_id") for m in self.messages[last + 1:end]}
+        self.messages[end:end] = [
+            {"role": "tool", "tool_call_id": call.get("id", ""),
+             "content": "ERROR: this call was not executed; the request was cancelled or superseded"}
+            for call in self.messages[last]["tool_calls"] if call.get("id") not in answered]
+
+    def trim(self, limit: int = CLIENT_CONTEXT_BYTES) -> None:
+        """Drop the oldest exchanges once the context outgrows the limit.
+
+        An exchange runs from one user message to the next, so an assistant
+        turn never loses the tool messages that answer it. The newest exchange
+        is always kept, however large.
+        """
+        def size() -> int:
+            return sum(len(json.dumps(m)) for m in self.messages)
+        while size() > limit:
+            users = [i for i, m in enumerate(self.messages) if i > 0 and m.get("role") == "user"]
+            if len(users) < 2:
+                break
+            del self.messages[1:users[1]]
+
+    async def _run(self, response_id: str, epoch: int) -> None:
+        session = self.session
+        delegation = self.delegation
+        turn = planner.Turn(text="")
+
+        async def event(kind: str, **data) -> None:
+            await session._backend_event({"delegation_id": delegation, "event": {"type": kind, **data}})
+
+        await event("response.created", response={"id": response_id})
+        try:
+            data, self.rung = await asyncio.to_thread(
+                planner._ask, list(self.messages), self.tools, self.ladder(), self.rung, turn)
+        except planner.PlannerUnavailable as exc:
+            for failover in turn.failovers:
+                session.feedback.log(f"warn    {failover}")
+            if session._can_reply(epoch):
+                await event("response.failed", response={"id": response_id, "output": [],
+                                                         "error": {"message": str(exc)}})
+            return
+        for failover in turn.failovers:
+            session.feedback.log(f"warn    {failover}")
+        if not session._can_reply(epoch):
+            return
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        text = (message.get("content") or "").strip()
+        calls = [call for call in message.get("tool_calls") or [] if isinstance(call, dict)]
+        assistant = {"role": "assistant", "content": message.get("content") or ""}
+        if calls:
+            assistant["tool_calls"] = calls
+        self.messages.append(assistant)
+        status = "incomplete" if choice.get("finish_reason") == "length" else "completed"
+        for call in calls:
+            function = call.get("function") or {}
+            await event("response.output_item.done", response_id=response_id, item={
+                "type": "function_call", "call_id": call.get("id", ""), "name": function.get("name", ""),
+                "arguments": function.get("arguments") or "{}", "status": status})
+        if text:
+            # Text beside tool calls is progress; text alone is the answer.
+            await session._client_result(text, delegation, spoken=not calls)
+        await event("response.completed", response={
+            "id": response_id, "output": [], "usage": data.get("usage") or {},
+            "model": turn.model, "provider": turn.provider})
+
+
 class LiveSession:
     def __init__(self, config: Config):
         self.config = config
@@ -200,6 +399,10 @@ class LiveSession:
         self._action_lock = asyncio.Lock()
         self._responses: dict[str, BackendResponse] = {}
         self._current_response: dict[str, str] = {}
+        self._client: ClientBackend | None = None
+        self._client_pending: tuple[str, float] | None = None
+        self._backend_instructions = ""
+        self._last_toggle_at = 0.0
         self._delegations: set[str] = set()
         self._delegation_revisions: dict[str, int] = {}
         self._task_rounds: dict[str, int] = {}
@@ -326,6 +529,8 @@ class LiveSession:
                 or time.monotonic() - self._last_input_at < STEERING_SETTLE_SECONDS):
             return
         text, self._steering_text = self._steering_text, ""
+        # The forwarded text covers any client delegation still waiting to be built.
+        self._client_pending = None
         self._input_forwarded = True
         self._forwarded_completed = False
         self._revision += 1
@@ -345,10 +550,10 @@ class LiveSession:
             self._delegation_revisions[delegation] = self._revision
         await self._append("thinking", f"Application routed spoken update {self._utterance} to the backend. "
                            "That update is already being handled. Earlier unfinished requests remain in its context.")
-        await self._send({"type": "response.item.create", "item": {
+        await self._backend_send({"type": "response.item.create", "item": {
             "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
         self._backend_requested = True
-        await self._send({"type": "response.create"})
+        await self._backend_send({"type": "response.create"})
         self._trace("forwarded_input", text=text)
         self._perf("steering_forwarded", revision=self._revision,
                    since_input_delta_ms=round((time.monotonic() - self._last_input_at) * 1000, 1))
@@ -394,20 +599,28 @@ class LiveSession:
         if self.config.vision_enabled:
             from .vision import VOICE_ROUTING
             voice_prompt += VOICE_ROUTING
-        return {"type": "session.start", "session": {
+        self._backend_instructions = instructions
+        session = {
             "model": self.config.live_model, "instructions": voice_prompt,
             "store": False,
             "input": [{"type": "message", "role": x["role"], "content": [{
                 "type": "input_text" if x["role"] == "user" else "output_text",
                 "text": x["text"]}]} for x in self._history],
             "audio": {"format": {"type": "audio/pcm", "rate": self.config.live_sample_rate},
-                      "output": {"voice": self.config.live_voice}},
-            "delegation": {"type": "responses", "responses": {
+                      "output": {"voice": self.config.live_voice}}}
+        if self.config.live_delegation == "client":
+            # Live only signals that help is wanted; the daemon owns the backend.
+            self._client = ClientBackend(self, instructions, tools, self._history)
+            session["delegation"] = {"type": "client"}
+        else:
+            self._client = None
+            session["delegation"] = {"type": "responses", "responses": {
                 "model": self.config.live_backend_model, "instructions": instructions,
                 "tools": tools, "tool_choice": "auto", "parallel_tool_calls": True,
                 "max_output_tokens": self.config.live_max_output_tokens,
                 "reasoning": {"effort": self.config.live_reasoning_effort},
-                "service_tier": self.config.live_service_tier}}}}
+                "service_tier": self.config.live_service_tier}}
+        return {"type": "session.start", "session": session}
 
     async def _send(self, payload):
         if self.ws is None:
@@ -420,21 +633,84 @@ class LiveSession:
             if payload["type"] != "session.input_audio.append":
                 if payload["type"] == "session.start":
                     self._trace("session_config", model=self.config.live_model,
+                                delegation=self.config.live_delegation,
                                 backend_model=self.config.live_backend_model,
                                 tier=self.config.live_service_tier, max_turns=self.config.max_turns,
                                 max_parallel=self.config.live_max_parallel_tools,
                                 voice_prompt=VOICE_PROMPT,
-                                backend_prompt=payload["session"]["delegation"]["responses"]["instructions"])
+                                backend_prompt=self._backend_instructions)
                 else:
                     self._trace("send", payload=payload)
             await self.ws.send(json.dumps(payload))
 
-    async def _append(self, kind, text):
+    async def _backend_send(self, payload):
+        """A backend command: to Live's Responses backend, or to our own.
+
+        `response.item.create` queues an item and `response.create` runs or
+        continues the backend. With Responses delegation both go over the
+        socket; with client delegation the daemon is the backend.
+        """
+        if self._client is None:
+            await self._send(payload)
+            return
+        self._trace("backend_send", payload=payload)
+        if payload["type"] == "response.item.create":
+            self._client.add_item(payload["item"])
+        elif payload["type"] == "response.create":
+            self._backend_requested_at = time.monotonic()
+            self._client.create()
+        else:
+            raise ValueError(f"{payload['type']} is not a backend command")
+
+    async def _append(self, kind, text, delegation=None):
         if self._ready and not self._closing:
             # At most 500 UTF-8 bytes, conservatively below the 500-token limit.
-            text = text.encode()[:500].decode("utf-8", errors="ignore")
+            text = text.encode()[:APPEND_BYTES].decode("utf-8", errors="ignore")
             await self._send({"type": f"session.{kind}.append",
-                              "delegation_id": None, "content": text})
+                              "delegation_id": delegation, "content": text})
+
+    def _result_target(self, delegation):
+        """The delegation id a result may carry: only a known client delegation."""
+        return delegation if self._client is not None and delegation in self._delegations else None
+
+    async def _client_result(self, text, delegation, *, spoken):
+        """Hand a client backend's text to the voice model.
+
+        An answer is commentary, which the model paraphrases aloud. Text that
+        came with tool calls is progress, appended quietly as thinking.
+        """
+        target = self._result_target(delegation)
+        chunks = split_append(text) if spoken else split_append(text)[:1]
+        for chunk in chunks:
+            await self._append("commentary" if spoken else "thinking", chunk, delegation=target)
+        self._trace("client_result", delegation_id=delegation, spoken=spoken, text=text)
+
+    async def _dispatch_client(self):
+        """Build and run the request for a client delegation once the transcript settles.
+
+        The delegation event carries metadata only; the utterance comes from
+        the input transcript. Waiting for outstanding backend work first keeps
+        the ordering rules that steering already enforces.
+        """
+        if self._client is None or not self._client_pending:
+            return
+        identity, since = self._client_pending
+        if self._backend_busy() or self._steering_text:
+            return
+        now = time.monotonic()
+        text = self._input_text.strip()
+        settled = bool(self._last_input_at) and now - self._last_input_at >= CLIENT_SETTLE_SECONDS
+        if not (text and settled) and now - since < CLIENT_TRANSCRIPT_WAIT_SECONDS:
+            return
+        self._client_pending = None
+        self._client.delegation = identity
+        if not text:
+            text = "(The user spoke, but no transcript reached the application. Ask them to repeat the request.)"
+        self._trace("client_delegation_dispatched", delegation_id=identity, text=text)
+        await self._backend_send({"type": "response.item.create", "item": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+        self._backend_requested = True
+        await self._backend_send({"type": "response.create"})
 
     def _on_action(self, name, description):
         self.feedback.log(f"action  {description}")
@@ -459,7 +735,7 @@ class LiveSession:
         if verb == "quit":
             self.loop.call_soon_threadsafe(self._stop.set)
             return "stopping"
-        handlers = {"toggle": lambda: self._set_active(not self.active),
+        handlers = {"toggle": self._toggle,
                     "start": lambda: self._set_active(True),
                     "stop": lambda: self._set_active(False),
                     "say": lambda: self._inject(text),
@@ -471,6 +747,16 @@ class LiveSession:
             return future.result(timeout=10)
         except Exception as exc:
             return f"error: {exc}"
+
+    async def _toggle(self):
+        # Measured from the last press, accepted or not, so a burst of chatter
+        # extends the window instead of slipping a second toggle through.
+        now, previous = time.monotonic(), self._last_toggle_at
+        self._last_toggle_at = now
+        if now - previous < realtime.TOGGLE_DEBOUNCE_SECONDS:
+            self.feedback.log("gate    repeated toggle within the debounce window; ignored")
+            return "listening" if self.active else "idle"
+        return await self._set_active(not self.active)
 
     async def _set_active(self, active):
         self.active = active
@@ -648,7 +934,11 @@ class LiveSession:
         elif kind == "session.delegation.created":
             delegation = event.get("delegation", {})
             identity = delegation.get("id")
-            if delegation.get("target") == "responses" and identity not in self._delegations:
+            target = delegation.get("target")
+            expected = "client" if self._client is not None else "responses"
+            if target != expected:
+                self._trace("delegation_ignored", delegation=delegation, expected=expected)
+            elif identity not in self._delegations:
                 self._delegations.add(identity)
                 if self._application_owned and not self._backend_requested:
                     # A late frontend delegation must not supersede the explicit
@@ -658,11 +948,15 @@ class LiveSession:
                     return
                 self._routed_utterance = self._utterance
                 self._recover_next_input = False
-                self._trace("delegation_created", delegation=delegation,
+                self._trace("delegation_created", delegation=delegation, offset_ms=event.get("offset_ms"),
                             steering_pending=bool(self._steering_text), input_text=self._input_text)
                 self._revision += 1
                 self._delegation_revisions[identity] = self._revision
                 self._last_activity = time.monotonic()
+                if target == "client":
+                    # Metadata only: the request is built from the transcript
+                    # by _dispatch_client once the utterance has settled.
+                    self._client_pending = (identity, time.monotonic())
         elif kind == "response.event":
             await self._backend_event(event)
         elif kind in ("session.usage.updated", "session.closed"):
@@ -739,15 +1033,17 @@ class LiveSession:
                        duration_ms=round((time.monotonic() - record.started_at) * 1000, 1))
             self._last_activity = time.monotonic()
             if response.get("usage"):
-                self.feedback.log(f"usage   backend model={self.config.live_backend_model} "
+                self.feedback.log(f"usage   backend model={response.get('model') or self.config.live_backend_model} "
                                   f"response={response_id} {json.dumps(response['usage'])}")
+            target = self._result_target(delegation)
             if kind != "response.completed":
                 self.feedback.log(f"error   backend {kind}: {json.dumps(response.get('error'))}")
-                await self._append("commentary", "That backend task did not complete. No success is confirmed.")
+                await self._append("commentary", "That backend task did not complete. No success is confirmed.",
+                                   delegation=target)
             elif any(call.get("status", "completed") != "completed" for call in record.calls):
                 self._recover_next_input = True
                 await self._append("commentary", "The backend returned an incomplete tool call. "
-                                   "No calls from that response were executed.")
+                                   "No calls from that response were executed.", delegation=target)
             elif record.calls:
                 record.queued_at = time.monotonic()
                 self._pending_jobs += 1
@@ -885,7 +1181,7 @@ class LiveSession:
             self.feedback.log(f"note    stale result retained locally for {call_id}")
             return
         self._trace("call_returned", call_id=call_id, response_id=record.response_id, output=output)
-        await self._send({"type": "response.item.create", "item": {
+        await self._backend_send({"type": "response.item.create", "item": {
             "type": "function_call_output", "call_id": call_id, "output": output}})
         return output
 
@@ -927,24 +1223,25 @@ class LiveSession:
                             pass  # Housekeeping forwards the complete update after this batch drains.
                         elif self._current(epoch, record) and self._task_rounds.get(record.delegation, 0) < self.config.max_turns:
                             self._backend_requested = True
-                            await self._send({"type": "response.create"})
+                            await self._backend_send({"type": "response.create"})
                         elif self._current(epoch, record):
                             self._recover_next_input = True
                             self._trace("task_limit", delegation_id=record.delegation,
                                         rounds=self._task_rounds.get(record.delegation, 0))
                             if record.delegation not in self._limit_summaries:
                                 self._limit_summaries.add(record.delegation)
-                                await self._send({"type": "response.item.create", "item": {
+                                await self._backend_send({"type": "response.item.create", "item": {
                                     "type": "message", "role": "user", "content": [{
                                         "type": "input_text", "text": "Application execution limit reached for this request. "
                                         "Do not call more tools. Give a concise partial result: what completed, "
                                         "what failed, and each unfinished request. The application will accept "
                                         "a new spoken instruction with a fresh tool budget."}]}})
                                 self._backend_requested = True
-                                await self._send({"type": "response.create"})
+                                await self._backend_send({"type": "response.create"})
                             else:
                                 await self._append("commentary", "The task stopped at its step limit. "
-                                                   "Some requested work is unfinished. I can accept a new instruction.")
+                                                   "Some requested work is unfinished. I can accept a new instruction.",
+                                                   delegation=self._result_target(record.delegation))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1004,8 +1301,9 @@ class LiveSession:
                 await asyncio.wait_for(self._closed.wait(), CLOSE_TIMEOUT)
                 return
             await self._forward_steering()
+            await self._dispatch_client()
             await self._routing_watchdog()
-            busy = self._backend_busy() or bool(self._steering_text)
+            busy = self._backend_busy() or bool(self._steering_text) or bool(self._client_pending)
             if self._typed and not busy:
                 text = self._typed.popleft()
                 self._last_input_at = time.monotonic()
@@ -1022,10 +1320,10 @@ class LiveSession:
                 for delegation in self._delegation_revisions:
                     self._delegation_revisions[delegation] = self._revision
                 self._trace("task_budget_reset", reason="new typed request")
-                await self._send({"type": "response.item.create", "item": {
+                await self._backend_send({"type": "response.item.create", "item": {
                     "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
                 self._backend_requested = True
-                await self._send({"type": "response.create"})
+                await self._backend_send({"type": "response.create"})
                 self._last_activity = now
             elif (not self.active and not busy and not self._typed
                   and now - self._last_activity >= self.config.live_typed_idle_seconds):
@@ -1062,6 +1360,7 @@ class LiveSession:
         self._forwarded_completed = False
         self._last_input_at = 0.0
         self._backend_requested = False
+        self._client_pending = None
         start = await self._session_start()
         if not self._wanted.is_set() or self._stop.is_set():
             return
@@ -1081,8 +1380,10 @@ class LiveSession:
                 await self.speaker.start()
                 if self._connect_requested_at:
                     self._perf("session_ready", duration_ms=round((time.monotonic() - self._connect_requested_at) * 1000, 1))
+                backend = ("client delegation over the planner ladder" if self._client is not None
+                           else self.config.live_backend_model)
                 self.feedback.log(f"start   engine=live session={event.get('session', {}).get('id')} "
-                                  f"model={self.config.live_model} backend={self.config.live_backend_model}")
+                                  f"model={self.config.live_model} backend={backend}")
                 self._settle()
                 tasks = [asyncio.create_task(self._read(ws)), asyncio.create_task(self._audio_loop()),
                          asyncio.create_task(self._housekeeping())]
@@ -1104,6 +1405,8 @@ class LiveSession:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._client is not None:
+                await self._client.close()
             if self._state_version != self._persisted_version:
                 await self._persist_state()
             await self._kill_mic()
@@ -1224,6 +1527,14 @@ class LiveSession:
 
 def run(config: Config) -> int:
     problems = config_problems(config) + realtime.check_ready(config)
+    if config.live_delegation == "client":
+        # The daemon is the backend, so the planner ladder must be able to answer.
+        try:
+            ladder = providers.chat_ladder(config)
+        except ValueError as exc:
+            problems.append(f"provider config: {exc}")
+        else:
+            problems.extend(providers.missing_keys(ladder))
     if any(config.api_key_env in problem for problem in problems):
         Feedback(config).state("unconfigured", f"Set {config.api_key_env} in {cfg.ENV_FILE}")
         return 0

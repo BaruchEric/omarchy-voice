@@ -261,8 +261,10 @@ def cmd_doctor(args, config) -> int:
         except ValueError as exc:
             print(f"  {_tick(False)} {which}: {exc}")
             continue
+        used_by = ("`omarchy-voice say`" + (" and Live client delegation"
+                   if config.engine == "live" and config.live_delegation == "client" else ""))
         print(f"  → {which} ladder: {' → '.join(p.name for p in ladder)}"
-              + (" (`omarchy-voice say`)" if which == "planner" else ""))
+              + (f" ({used_by})" if which == "planner" else ""))
         for provider in ladder:
             has_key = provider.has_key()
             where = "" if has_key else f"  ({provider.api_key_env} not set; put it in {cfg.ENV_FILE})"
@@ -275,7 +277,11 @@ def cmd_doctor(args, config) -> int:
         print(f"  {_tick(key)} {config.api_key_env}"
               + ("" if key else f"  (put it in {cfg.ENV_FILE})"))
         print(f"  → Live model {config.live_model}, voice {config.live_voice}")
-        print(f"  → backend {config.live_backend_model}, max output {config.live_max_output_tokens}")
+        if config.live_delegation == "client":
+            print("  → backend: client delegation; the daemon runs the planner ladder above")
+        else:
+            print(f"  → backend {config.live_backend_model}, max output {config.live_max_output_tokens}, "
+                  f"tier {config.live_service_tier}")
         print("  → Live voice: $0.05/minute plus backend usage; disconnects on mute")
     if config.tasks_enabled:
         from .tasks import validate_config
@@ -307,7 +313,7 @@ def cmd_doctor(args, config) -> int:
     else:
         print(f"  {_tick(True)} websockets, API key, and PipeWire tools all present")
     if config.engine == "live":
-        print("  → OpenAI Live with Responses delegation, toggle-only")
+        print(f"  → OpenAI Live with {config.live_delegation} delegation, toggle-only")
         print(f"  → session limit {config.live_max_session_seconds:g}s; no connection at boot")
     else:
         print(f"  → OpenAI Realtime (speech to speech), "

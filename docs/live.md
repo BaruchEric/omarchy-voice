@@ -1,9 +1,57 @@
 # Live backend
 
-Live handles voice conversation while a separate Responses model chooses desktop
+Live handles voice conversation while a separate backend chooses desktop
 tools. Those tools run locally through the same executor and policy as Realtime.
 Realtime remains the default; Live requires account access to its configured
-voice and backend models.
+voice model, and to the backend model when Live runs the backend itself.
+
+## Delegation modes
+
+GPT-Live delegates reasoning and tool use to a backend and keeps the spoken
+conversation for itself. `live.delegation` picks who runs that backend. The
+mode is fixed when a session starts, so change it while muted.
+
+| Mode | Who reasons | Configure |
+| --- | --- | --- |
+| `responses` (default) | OpenAI runs `live.backend_model` with the desktop tools registered on the session. The daemon executes each collected function call and continues the response. | `backend_model`, `reasoning_effort`, `service_tier`, `max_output_tokens` under `[live]` |
+| `client` | The daemon. Live only announces that help is wanted; the daemon builds the request from its own transcript, runs a Chat Completions tool loop over the planner ladder, and appends the verified answer to the conversation. | `[routing] planner` and `[providers.<name>]`, the same ladder `omarchy-voice say` uses |
+
+With Responses delegation, the daemon collects function calls from the
+forwarded `response.output_item.done` events, returns each result as a
+`function_call_output` item, and sends `response.create` to continue. Live
+strips output from its lifecycle snapshots, so an empty terminal output list
+is not treated as "nothing to run".
+
+With client delegation, the delegation event carries metadata only. The daemon
+keeps the transcript itself, waits a moment for the utterance to settle, and
+sends the text to the first rung of the planner ladder that answers; a rung
+that fails hands the request to the next one mid-turn. Tool calls run through
+the same worker, budgets and confirmation holds as Responses delegation. The
+answer goes back as `session.commentary.append` under the delegation id, in
+pieces of at most 500 bytes, and the voice model paraphrases it. Text that
+arrives beside tool calls is appended quietly as thinking. Typed requests and
+forwarded corrections use the same backend and carry no delegation id.
+
+Client mode lets a non-OpenAI endpoint think for a voice session while Live
+keeps the speech: OpenRouter, Groq, a LiteLLM proxy, or a model on the LAN. It
+costs one Chat Completions request per backend round instead of Live's managed
+connection, and Live's own backend reuse and priority tier do not apply. The
+backend prompt, the desktop snapshot, and the installed app list are the same
+in both modes.
+
+```toml
+[openai]
+engine = "live"
+
+[live]
+delegation = "client"
+
+[routing]
+planner = ["groq", "openai"]
+```
+
+`omarchy-voice doctor` names the mode and, for client delegation, the ladder
+it will use.
 
 ## Select an engine
 
@@ -46,9 +94,9 @@ The application does not enforce an account-wide spending cap.
 | --- | --- |
 | `live.max_session_seconds` | Stops a session at its time limit; listening must be enabled again |
 | `live.typed_idle_seconds` | Closes an inactive typed session when backend work and queued input are clear; received non-silent audio resets the timer |
-| `openai.max_turns` | Bounds tool rounds for a request |
-| `live.max_output_tokens` | Limits each backend response |
-| `live.service_tier` | Selects standard or priority backend processing |
+| `openai.max_turns` | Bounds tool rounds for a request, in either delegation mode |
+| `live.max_output_tokens` | Limits each backend response (Responses delegation) |
+| `live.service_tier` | `auto`, `default`, `flex` or `priority` backend processing (Responses delegation) |
 | `live.browser_max_turns` / `live.browser_timeout_seconds` | Bounds delegated browser work |
 
 Toggling off closes the Live session and stops microphone capture and playback.

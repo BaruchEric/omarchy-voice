@@ -93,9 +93,15 @@ max_requests = 20                  # no automatic background analysis or retries
 model = "gpt-live-1"
 voice = "marin"
 backend_model = "gpt-5.6-terra"
+# Who does the reasoning behind the voice. "responses": Live calls backend_model
+# itself. "client": the daemon runs the backend over the planner ladder under
+# [routing], so OpenRouter, Groq, LiteLLM or any Chat Completions endpoint can
+# think for a voice session; backend_model, reasoning_effort, service_tier and
+# max_output_tokens then do not apply. Changing it needs a new session.
+delegation = "responses"  # responses | client
 sample_rate = 24000       # 16000 or 24000; raw mono PCM16
 reasoning_effort = "low"
-service_tier = "default"  # priority requests faster processing at higher backend token prices
+service_tier = "default"  # auto | default | flex | priority; priority costs more per backend token
 # Concurrent independent calls; shared focus/layout actions stay ordered.
 max_parallel_tools = 4
 # Complex browser tasks go to a bounded Astra computer-use worker.

@@ -56,24 +56,30 @@ class Connection:
         pass
 
 
+def private_session(test, **settings):
+    """A LiveSession on a private state directory, wired to a fake socket."""
+    test.tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(test.tmp.cleanup)
+    test.root = Path(test.tmp.name)
+    for module, fields in ((config, {"STATE_DIR": test.root}), (feedback, {
+        "STATE_DIR": test.root, "RUNTIME_DIR": test.root,
+        "LOG_FILE": test.root / "session.log", "STATE_FILE": test.root / "state.json",
+        "LEVEL_FILE": test.root / "level"})):
+        for name, value in fields.items():
+            patcher = mock.patch.object(module, name, value)
+            patcher.start()
+            test.addCleanup(patcher.stop)
+    test.session = live.LiveSession(config.Config(engine="live", notify=False, dry_run=True,
+                                                  network_enabled=False, **settings))
+    test.socket = Socket()
+    test.session.ws = test.socket
+    test.session._ready = True
+    test.session._started_at = time.monotonic()
+
+
 class LiveTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        for module, fields in ((config, {"STATE_DIR": self.root}), (feedback, {
-            "STATE_DIR": self.root, "RUNTIME_DIR": self.root,
-            "LOG_FILE": self.root / "session.log", "STATE_FILE": self.root / "state.json",
-            "LEVEL_FILE": self.root / "level"})):
-            for name, value in fields.items():
-                patcher = mock.patch.object(module, name, value)
-                patcher.start()
-                self.addCleanup(patcher.stop)
-        self.session = live.LiveSession(config.Config(engine="live", notify=False, dry_run=True, network_enabled=False))
-        self.socket = Socket()
-        self.session.ws = self.socket
-        self.session._ready = True
-        self.session._started_at = time.monotonic()
+        private_session(self)
 
     async def backend(self, kind, *, delegation="d1", response_id="r1", **data):
         await self.session._on_event({"type": "response.event", "delegation_id": delegation,
@@ -151,8 +157,11 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(live.capabilities, "installed_apps", return_value="apps"):
             start = await self.session._session_start()
         self.assertEqual(start["session"]["delegation"]["responses"]["service_tier"], "priority")
-        self.session.config.live_service_tier = "auto"
-        self.assertIn("live.service_tier must be default or priority",
+        for tier in ("auto", "flex"):
+            self.session.config.live_service_tier = tier
+            self.assertEqual(live.config_problems(self.session.config), [])
+        self.session.config.live_service_tier = "turbo"
+        self.assertIn("live.service_tier must be auto, default, flex or priority",
                       live.config_problems(self.session.config))
 
     async def test_collected_calls_execute_despite_empty_terminal_output(self):
@@ -337,6 +346,18 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             await self.drain()
         execute.assert_not_called()
         self.assertEqual(self.socket.events("response.create"), [])
+
+    async def test_repeated_toggles_within_the_debounce_window_count_once(self):
+        with mock.patch.object(self.session, "_kill_mic", new=mock.AsyncMock()), \
+             mock.patch.object(self.session.speaker, "interrupt", new=mock.AsyncMock()), \
+             mock.patch.object(self.session.executor.vision, "stop_owned"):
+            self.assertEqual(await self.session._toggle(), "listening")
+            for _ in range(4):  # key chatter or a held key
+                self.assertEqual(await self.session._toggle(), "listening")
+            self.assertTrue(self.session.active)
+            self.session._last_toggle_at -= 1
+            self.assertEqual(await self.session._toggle(), "idle")
+            self.assertFalse(self.session.active)
 
     async def test_mute_stops_queued_actions_and_requests_close(self):
         await self.response([self.call()])
@@ -874,15 +895,240 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
 
 
+class ClientDelegationTests(unittest.IsolatedAsyncioTestCase):
+    """Client delegation: the daemon is the backend, over the planner ladder.
+
+    No API calls are made; the ladder's chat request is replaced with canned
+    Chat Completions answers.
+    """
+
+    def setUp(self):
+        private_session(self, live_delegation="client")
+        env = mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    async def asyncSetUp(self):
+        with mock.patch.object(live.capabilities, "manifest", return_value="TOOLS MANIFEST"), \
+             mock.patch.object(live.capabilities, "live_state", return_value="DESKTOP"), \
+             mock.patch.object(live.capabilities, "installed_apps", return_value="apps"):
+            self.start = await self.session._session_start()
+
+    async def asyncTearDown(self):
+        await self.session._client.close()
+
+    def answer(self, content=None, tool_calls=None, finish_reason=None):
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return ({"choices": [{"message": message,
+                              "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop")}],
+                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}}, 0)
+
+    def tool_call(self, identity="c1", name="hypr_query", arguments='{"what":"clients"}'):
+        return {"id": identity, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+    async def delegate(self, text="open stocks", identity="d1"):
+        await self.session._on_event({"type": "session.input_transcript.delta", "delta": text,
+                                      "start_ms": 0, "end_ms": 500})
+        await self.session._on_event({"type": "session.delegation.created", "offset_ms": 900,
+                                      "delegation": {"id": identity, "type": "delegation", "target": "client"}})
+        self.session._last_input_at -= 1
+        await self.session._dispatch_client()
+
+    async def settle(self):
+        worker = asyncio.create_task(self.session._tool_worker())
+        try:
+            for _ in range(400):
+                await asyncio.sleep(0.005)
+                if not self.session._backend_busy() and self.session._jobs.empty():
+                    break
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_session_start_selects_client_mode_and_keeps_the_backend_prompt_local(self):
+        session = self.start["session"]
+        self.assertEqual(session["delegation"], {"type": "client"})
+        self.assertNotIn("TOOLS MANIFEST", session["instructions"])
+        backend = self.session._client
+        self.assertIn("TOOLS MANIFEST", backend.messages[0]["content"])
+        self.assertEqual(backend.messages[0]["role"], "system")
+        names = {tool["function"]["name"] for tool in backend.tools}
+        self.assertTrue({"hypr_query", "browser_task", "confirm_last"} <= names)
+        self.assertTrue(all(tool["type"] == "function" and "parameters" in tool["function"]
+                            for tool in backend.tools))
+
+    async def test_delegation_runs_the_ladder_and_speaks_the_result_under_its_id(self):
+        with mock.patch.object(live.planner, "_ask", return_value=self.answer("Stocks is open on workspace 2.")) as ask:
+            await self.delegate()
+            await self.settle()
+        messages = ask.call_args.args[0]
+        self.assertEqual(messages[-1], {"role": "user", "content": "open stocks"})
+        self.assertEqual(messages[0]["role"], "system")
+        spoken = self.socket.events("session.commentary.append")
+        self.assertEqual(len(spoken), 1)
+        self.assertEqual(spoken[0]["delegation_id"], "d1")
+        self.assertEqual(spoken[0]["content"], "Stocks is open on workspace 2.")
+        self.assertFalse(self.socket.events("response.item.create"))
+        self.assertFalse(self.socket.events("response.create"))
+        self.assertFalse(self.session._backend_busy())
+        self.assertIsNone(self.session._client_pending)
+
+    async def test_tool_calls_run_locally_and_their_outputs_feed_the_next_request(self):
+        answers = [self.answer("Checking.", [self.tool_call()]), self.answer("Two windows are open.")]
+        with mock.patch.object(live.planner, "_ask", side_effect=answers) as ask, \
+             mock.patch.object(self.session.executor, "call", return_value=Result(True, "clients: 2")) as execute:
+            await self.delegate("what windows are open")
+            await self.settle()
+        execute.assert_called_once()
+        self.assertEqual(ask.call_count, 2)
+        second = ask.call_args_list[1].args[0]
+        self.assertEqual(second[-2]["role"], "assistant")
+        self.assertEqual(second[-2]["tool_calls"][0]["id"], "c1")
+        self.assertEqual(second[-1], {"role": "tool", "tool_call_id": "c1", "content": "clients: 2"})
+        quiet = self.socket.events("session.thinking.append")
+        self.assertEqual(quiet[-1]["content"], "Checking.")
+        self.assertEqual(quiet[-1]["delegation_id"], "d1")
+        spoken = self.socket.events("session.commentary.append")
+        self.assertEqual([x["content"] for x in spoken], ["Two windows are open."])
+        self.assertEqual(self.session._task_rounds["d1"], 1)
+        self.assertFalse(self.socket.events("response.item.create"))
+
+    async def test_ladder_failure_reports_no_success_and_frees_the_backend(self):
+        with mock.patch.object(live.planner, "_ask", side_effect=live.planner.PlannerUnavailable("every rung failed")):
+            await self.delegate()
+            await self.settle()
+        spoken = self.socket.events("session.commentary.append")
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("did not complete", spoken[0]["content"])
+        self.assertEqual(spoken[0]["delegation_id"], "d1")
+        self.assertFalse(self.session._backend_busy())
+        self.assertIn("every rung failed", (self.root / "session.log").read_text())
+
+    async def test_typed_request_uses_the_client_backend_without_a_delegation(self):
+        await self.session._inject("workspace 3")
+        with mock.patch.object(live.planner, "_ask", return_value=self.answer("You are on workspace 3.")) as ask:
+            task = asyncio.create_task(self.session._housekeeping())
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await self.settle()
+        self.assertEqual(ask.call_args.args[0][-1], {"role": "user", "content": "workspace 3"})
+        spoken = self.socket.events("session.commentary.append")
+        self.assertEqual(spoken[-1]["content"], "You are on workspace 3.")
+        self.assertIsNone(spoken[-1]["delegation_id"])
+        self.assertFalse(self.socket.events("response.create"))
+
+    async def test_delegation_waits_for_the_transcript_then_gives_up_waiting(self):
+        await self.session._on_event({"type": "session.delegation.created",
+                                      "delegation": {"id": "d1", "target": "client"}})
+        with mock.patch.object(live.planner, "_ask", return_value=self.answer("Please repeat that.")) as ask:
+            await self.session._dispatch_client()
+            self.assertIsNotNone(self.session._client_pending)
+            ask.assert_not_called()
+            identity, since = self.session._client_pending
+            self.session._client_pending = (identity, since - live.CLIENT_TRANSCRIPT_WAIT_SECONDS - 1)
+            await self.session._dispatch_client()
+            await self.settle()
+        self.assertIn("no transcript", ask.call_args.args[0][-1]["content"])
+
+    async def test_delegation_while_busy_waits_and_forwarded_speech_replaces_it(self):
+        await self.session._on_event({"type": "session.input_transcript.delta", "delta": "open stocks"})
+        await self.session._on_event({"type": "session.delegation.created",
+                                      "delegation": {"id": "d1", "target": "client"}})
+        self.session._backend_requested = True  # a request is in flight
+        self.session._last_input_at -= 1
+        await self.session._dispatch_client()
+        self.assertIsNotNone(self.session._client_pending)
+        self.session._backend_requested = False
+        self.session._steering_text = "open stocks and the news"
+        self.session._last_input_at -= 2
+        with mock.patch.object(live.planner, "_ask", return_value=self.answer("Both are open.")) as ask:
+            await self.session._forward_steering()
+            self.assertIsNone(self.session._client_pending)
+            await self.settle()
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(ask.call_args.args[0][-1]["content"], "open stocks and the news")
+
+    async def test_responses_delegation_is_ignored_in_client_mode(self):
+        await self.session._on_event({"type": "session.delegation.created",
+                                      "delegation": {"id": "r1", "target": "responses"}})
+        self.assertNotIn("r1", self.session._delegations)
+        self.assertIsNone(self.session._client_pending)
+
+    async def test_unanswered_calls_are_settled_before_the_next_request(self):
+        backend = self.session._client
+        backend.messages += [
+            {"role": "user", "content": "close both"},
+            {"role": "assistant", "content": "", "tool_calls": [self.tool_call("a"), self.tool_call("b")]},
+            {"role": "tool", "tool_call_id": "a", "content": "closed"},
+            {"role": "user", "content": "never mind"}]
+        backend.settle_calls()
+        roles = [(m["role"], m.get("tool_call_id")) for m in backend.messages[-4:]]
+        self.assertEqual(roles, [("assistant", None), ("tool", "a"), ("tool", "b"), ("user", None)])
+        self.assertIn("not executed", backend.messages[-2]["content"])
+
+    async def test_context_trims_whole_exchanges_and_keeps_the_newest(self):
+        backend = self.session._client
+        filler = "x" * 4000
+        for number in range(6):
+            backend.messages += [
+                {"role": "user", "content": f"request {number}"},
+                {"role": "assistant", "content": "", "tool_calls": [self.tool_call(f"c{number}")]},
+                {"role": "tool", "tool_call_id": f"c{number}", "content": filler},
+                {"role": "assistant", "content": f"answer {number}"}]
+        backend.trim(limit=20000)
+        self.assertEqual(backend.messages[0]["role"], "system")
+        self.assertEqual(backend.messages[1]["role"], "user")
+        self.assertEqual(backend.messages[-1]["content"], "answer 5")
+        self.assertLess(len(backend.messages), 25)
+        tools_answered = all(any(m.get("tool_call_id") == call["id"] for m in backend.messages)
+                             for m in backend.messages if m.get("tool_calls") for call in m["tool_calls"])
+        self.assertTrue(tools_answered)
+
+    async def test_long_tool_output_is_truncated_for_the_request(self):
+        backend = self.session._client
+        backend.add_item({"type": "function_call_output", "call_id": "c1", "output": "y" * 20000})
+        self.assertLess(len(backend.messages[-1]["content"]), 16100)
+        self.assertIn("truncated", backend.messages[-1]["content"])
+
+    def test_results_are_split_into_appends_under_the_limit(self):
+        text = " ".join(f"Sentence number {n} ends here." for n in range(60))
+        chunks = live.split_append(text)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk.encode()) <= live.APPEND_BYTES for chunk in chunks))
+        self.assertEqual(" ".join(chunks).split(), text.split())
+        self.assertEqual(live.split_append("short"), ["short"])
+        self.assertTrue(all(len(c.encode()) <= 500 for c in live.split_append("ü" * 700)))
+
+    def test_run_refuses_a_ladder_that_cannot_answer(self):
+        settings = config.Config(engine="live", live_delegation="client", routing_planner=["nowhere"])
+        with mock.patch.object(live.realtime, "check_ready", return_value=[]), \
+             mock.patch.object(live, "config_problems", return_value=[]), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(live.run(settings), 1)
+        self.assertIn("nowhere", " ".join(str(call.args[0]) for call in printed.call_args_list))
+
+
 class LiveConfigTests(unittest.TestCase):
     def test_live_table_is_namespaced(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "config.toml"
-            path.write_text('[openai]\nengine="live"\n[live]\nbackend_model="test"\nvoice="marin"\n')
+            path.write_text('[openai]\nengine="live"\n[live]\nbackend_model="test"\nvoice="marin"\n'
+                            'delegation="client"\n')
             loaded = config.load(path)
         self.assertEqual(loaded.engine, "live")
         self.assertEqual(loaded.live_backend_model, "test")
+        self.assertEqual(loaded.live_delegation, "client")
         self.assertEqual(loaded.unknown_keys, [])
+
+    def test_delegation_mode_is_validated(self):
+        self.assertEqual(live.config_problems(config.Config(live_delegation="client")), [])
+        self.assertIn("live.delegation must be responses or client",
+                      live.config_problems(config.Config(live_delegation="proxy")))
 
     def test_realtime_remains_available(self):
         self.assertEqual(config.Config().engine, "realtime")

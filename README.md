@@ -108,7 +108,9 @@ engine = "live"
 ```
 
 See [Live setup](docs/live.md) for model access, session limits, audio behavior,
-and switching engines. Shell execution is disabled by default. Confirmation
+delegation modes, and switching engines. Live can run its backend on OpenAI's
+Responses model, or hand the reasoning to the daemon (`live.delegation =
+"client"`), which then runs the planner ladder below. Shell execution is disabled by default. Confirmation
 rules reduce mistakes but do not make desktop automation a sandbox.
 
 ### Providers and failover
@@ -141,6 +143,11 @@ hosts. The `duplex`, `latency`, `cost` and `notes` fields are free text that
 `omarchy-voice doctor` prints next to each rung; nothing routes on them.
 `say --provider NAME` and `run --provider NAME` pin a single rung for one run.
 Keys for every rung go in `~/.config/omarchy-voice/env`.
+
+The planner ladder also serves the Live engine under `live.delegation = "client"`:
+GPT-Live keeps the conversation and the daemon runs the tool loop over these
+rungs, so a voice session can think on OpenRouter, Groq or a local proxy. See
+[Live setup](docs/live.md#delegation-modes).
 
 ElevenLabs is the one rung that does not speak OpenAI's protocol. A built-in
 `elevenlabs` profile talks to an [ElevenLabs Agents](https://elevenlabs.io/agents)

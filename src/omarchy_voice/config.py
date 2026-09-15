@@ -185,6 +185,11 @@ class Config:
     live_model: str = "gpt-live-1"
     live_voice: str = "marin"
     live_backend_model: str = "gpt-5.6-terra"
+    # Who runs the backend behind the voice model. "responses": Live calls the
+    # Responses model above itself. "client": the daemon runs the backend over
+    # the planner ladder ([routing] planner), so any Chat Completions endpoint
+    # can do the reasoning while GPT-Live keeps the conversation.
+    live_delegation: str = "responses"
     live_sample_rate: int = 24000
     live_max_output_tokens: int = 2048
     live_reasoning_effort: str = "low"

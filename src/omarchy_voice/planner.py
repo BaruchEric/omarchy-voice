@@ -93,17 +93,7 @@ class Planner:
         return turn
 
     def _ladder(self) -> list[Provider]:
-        try:
-            ladder = providers.chat_ladder(self.config, openai_chat_url=CHAT_URL)
-        except ValueError as exc:
-            raise PlannerUnavailable(f"provider config: {exc}") from exc
-        usable = [p for p in ladder if p.has_key()]
-        if not usable:
-            raise PlannerUnavailable(
-                "no planner provider has a key — put one of "
-                + ", ".join(p.api_key_env for p in ladder)
-                + " in ~/.config/omarchy-voice/env")
-        return usable
+        return usable_ladder(self.config)
 
     def _loop(self, text: str, turn: Turn) -> str:
         ladder = self._ladder()
@@ -158,6 +148,26 @@ class Planner:
                 return reply or "That needs confirmation."
 
         return reply or "Ran out of steps on that one."
+
+
+def usable_ladder(config: Config) -> list[Provider]:
+    """The planner ladder with keyless rungs dropped.
+
+    Shared with the Live engine's client delegation, which runs the same tool
+    loop over the same ladder. Raises PlannerUnavailable when nothing on the
+    ladder can answer.
+    """
+    try:
+        ladder = providers.chat_ladder(config, openai_chat_url=CHAT_URL)
+    except ValueError as exc:
+        raise PlannerUnavailable(f"provider config: {exc}") from exc
+    usable = [p for p in ladder if p.has_key()]
+    if not usable:
+        raise PlannerUnavailable(
+            "no planner provider has a key — put one of "
+            + ", ".join(p.api_key_env for p in ladder)
+            + " in ~/.config/omarchy-voice/env")
+    return usable
 
 
 def _ask(messages: list[dict], tools: list[dict], ladder: list[Provider],
